@@ -108,12 +108,15 @@ Arch: `./scripts/setup.sh` installs everything. Elsewhere you need gcc (with sta
 make              # build/zkernel.iso, plus disk.img the first time
 make run          # boot in qemu (bios)
 make run-uefi     # boot in qemu (uefi)
+make vbox         # boot in virtualbox
 make debug        # wait for gdb on :1234
 make disk         # wipe disk.img and make a fresh one
 make clean        # everything except disk.img
 ```
 
 `disk.img` is a 1 GiB sparse image (64 MiB FAT32 plus ext2, see "Files that stay" above). It survives rebuilds. If yours was made by an older build, run `make disk` once to get the current layout and labels. That wipes it.
+
+`make vbox` (`./scripts/vbox.sh`) makes a VirtualBox VM called ZKernel, or fixes an existing one with `--name`. If VirtualBox boots it and Limine says "This CPU does not support 64-bit mode", the VM's OS type is a 32 bit one: the script sets it to Other/Unknown (64-bit) with long mode on. If it still fails, VT-x/AMD-V is off in the host BIOS, or on Windows, Hyper-V is in the way. `disk.img` is copied to `disk.vdi` the first time, so changes made in VirtualBox stay in that copy.
 
 `make run` gives the VM a network card with QEMU's user networking. `./scripts/vm.sh --no-net` leaves it out.
 

@@ -1,6 +1,7 @@
 # make            build build/zkernel.iso
 # make run        boot in qemu (bios)
 # make run-uefi   boot in qemu (uefi)
+# make vbox       boot in virtualbox (makes or fixes the vm)
 # make debug      boot paused, gdb on :1234
 # make disk       fresh disk image (wipes the old one): 64 MiB fat, the rest ext2
 # make clean      everything but the disk image
@@ -58,7 +59,7 @@ USER_LIB     := $(BUILD)/user/lib/crt0.asm.o $(BUILD)/user/lib/zk.o $(BUILD)/use
 
 DISK := disk.img
 
-.PHONY: all run run-uefi debug clean disk FORCE
+.PHONY: all run run-uefi vbox debug clean disk FORCE
 all: $(ISO) $(DISK)
 
 # made once and kept, it's the persistent storage (see /etc/fstab):
@@ -169,6 +170,9 @@ run: $(ISO) $(DISK)
 
 run-uefi: $(ISO) $(DISK)
 	./scripts/vm.sh --uefi --disk $(DISK) $(ISO)
+
+vbox: $(ISO) $(DISK)
+	./scripts/vbox.sh $(ISO)
 
 debug: $(ISO) $(DISK)
 	./scripts/vm.sh --debug --disk $(DISK) $(ISO)
