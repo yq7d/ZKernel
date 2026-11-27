@@ -31,6 +31,18 @@ C_SRCS   := $(shell find kernel/src -name '*.c')
 ASM_SRCS := $(shell find kernel/src -name '*.asm')
 OBJS     := $(C_SRCS:%.c=$(BUILD)/%.o) $(ASM_SRCS:%.asm=$(BUILD)/%.asm.o)
 
+# user programs. no sse either, the kernel doesn't save fpu state yet
+USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra \
+               -ffreestanding -fno-stack-protector -fno-pic -fno-pie -fno-lto \
+               -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2 \
+               -Iuser/lib -Ikernel/src -Ikernel/include -MMD -MP
+USER_LDFLAGS := -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 \
+                -z noexecstack -T user/linker.ld
+USER_PROGS   := hello spin fault guess
+USER_BINS    := $(USER_PROGS:%=$(BUILD)/user/%.elf)
+USER_LIB     := $(BUILD)/user/lib/crt0.asm.o $(BUILD)/user/lib/zk.o \
+                $(BUILD)/user/klib/printf.o $(BUILD)/user/klib/string.o
+
 .PHONY: all run run-uefi debug clean FORCE
 all: $(ISO)
 
@@ -47,6 +59,24 @@ $(BUILD)/%.o: %.c
 $(BUILD)/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
 	$(AS) $(ASFLAGS) -MD $(@:.o=.d) -MP $< -o $@
+
+$(BUILD)/user/%.o: user/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/user/klib/%.o: kernel/src/lib/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(USER_CFLAGS) -c $< -o $@
+
+$(BUILD)/user/%.asm.o: user/%.asm
+	@mkdir -p $(dir $@)
+	$(AS) $(ASFLAGS) $< -o $@
+
+$(BUILD)/user/%.elf: $(BUILD)/user/%.o $(USER_LIB) user/linker.ld
+	$(LD) $(USER_LDFLAGS) $(USER_LIB) $< -o $@
+
+# user.asm incbins the programs
+$(BUILD)/kernel/src/proc/user.asm.o: $(USER_BINS)
 
 $(KERNEL): $(OBJS) kernel/linker.ld
 	$(LD) $(LDFLAGS) $(OBJS) -o $@
@@ -78,4 +108,4 @@ debug: $(ISO)
 clean:
 	rm -rf $(BUILD)
 
--include $(OBJS:.o=.d)
+-include $(OBJS:.o=.d) $(wildcard $(BUILD)/user/*.d $(BUILD)/user/*/*.d)

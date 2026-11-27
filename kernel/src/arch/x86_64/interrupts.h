@@ -16,6 +16,7 @@ typedef void (*interrupt_handler_t)(struct interrupt_frame *frame);
 
 void idt_init(void);
 void idt_set_handler(uint8_t vector, interrupt_handler_t handler);
+void idt_allow_user(uint8_t vector);
 void irq_set_handler(uint8_t irq, interrupt_handler_t handler);
 
 void exception_handle(struct interrupt_frame *frame);

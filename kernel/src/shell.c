@@ -11,6 +11,8 @@
 #include "mm/heap.h"
 #include "mm/mm.h"
 #include "mm/pmm.h"
+#include "proc/proc.h"
+#include "sched/sched.h"
 #include "tests/tests.h"
 
 #define LINE_MAX    128
@@ -104,6 +106,83 @@ static void cmd_reboot(int argc, char **argv)
         __asm__ volatile ("hlt");
 }
 
+static void cmd_ps(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    struct thread_info info[64];
+    int n = sched_snapshot(info, 64);
+    kprintf("  %-4s %-16s %-9s %-6s %s\n", "ID", "NAME", "STATE", "MODE", "CPU");
+    for (int i = n - 1; i >= 0; i--) {
+        kprintf("  %-4lu %-16s %-9s %-6s %lu.%03lus\n", info[i].id, info[i].name,
+                thread_state_name(info[i].state), info[i].user ? "user" : "kernel",
+                info[i].cpu_ticks / TIMER_HZ, info[i].cpu_ticks % TIMER_HZ);
+    }
+}
+
+static void demo_thread(void *arg)
+{
+    int id = (int)(uint64_t)arg;
+    for (int i = 1; i <= 3; i++) {
+        kprintf("  [demo %d] tick %d\n", id, i);
+        thread_sleep_ms((uint64_t)(100 * id));
+    }
+}
+
+static void cmd_demo(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    struct thread *t[3];
+    for (int i = 0; i < 3; i++)
+        t[i] = thread_create("demo", demo_thread, (void *)(uint64_t)(i + 1), true);
+    for (int i = 0; i < 3; i++)
+        thread_join(t[i]);
+    kprintf("  all demo threads finished\n");
+}
+
+static void cmd_progs(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    for (const struct program *p = program_list(); p->name; p++)
+        kprintf("  %-8s %zu bytes\n", p->name, p->size);
+}
+
+// run <prog> [args...] [&]
+static void cmd_run(int argc, char **argv)
+{
+    if (argc < 2) {
+        kprintf("usage: run <program> [args...] [&], see progs\n");
+        return;
+    }
+    bool background = strcmp(argv[argc - 1], "&") == 0;
+    if (background)
+        argc--;
+
+    const struct program *p = program_find(argv[1]);
+    if (!p) {
+        kprintf("%s: no such program\n", argv[1]);
+        return;
+    }
+    // a background process can finish and be freed right away, so grab
+    // its id before it gets a chance to run
+    const char *err;
+    uint64_t flags = irq_save();
+    struct thread *t = proc_spawn(p, argc - 1, argv + 1, background, &err);
+    uint64_t id = t ? t->id : 0;
+    irq_restore(flags);
+
+    if (!t) {
+        kprintf("%s: %s\n", argv[1], err);
+        return;
+    }
+    if (background) {
+        kprintf("[%lu] %s\n", id, p->name);
+        return;
+    }
+    int code = thread_join(t);
+    if (code)
+        kprintf("%s exited with %d\n", p->name, code);
+}
+
 static const struct command commands[] = {
     { "help",    "list commands",               cmd_help },
     { "clear",   "clear the screen",            cmd_clear },
@@ -111,6 +190,10 @@ static const struct command commands[] = {
     { "uptime",  "time since boot",             cmd_uptime },
     { "mem",     "memory usage",                cmd_mem },
     { "sleep",   "sleep <ms>",                  cmd_sleep },
+    { "ps",      "list threads",                cmd_ps },
+    { "demo",    "run three threads at once",   cmd_demo },
+    { "progs",   "list user programs",          cmd_progs },
+    { "run",     "run <prog> [args] [&]",       cmd_run },
     { "cmdline", "kernel command line",         cmd_cmdline },
     { "crash",   "crash <type>, test a fault",  cmd_crash },
     { "reboot",  "reboot the machine",          cmd_reboot },

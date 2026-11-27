@@ -2,6 +2,7 @@
 #include "arch/x86_64/gdt.h"
 #include "arch/x86_64/pic.h"
 #include "kprintf.h"
+#include "sched/sched.h"
 
 struct idt_entry {
     uint16_t offset_low;
@@ -52,6 +53,12 @@ void idt_init(void)
     __asm__ volatile ("lidt %0" : : "m"(idtr));
 }
 
+// lets ring 3 use `int vector`
+void idt_allow_user(uint8_t vector)
+{
+    idt[vector].type_attr = IDT_INTERRUPT_GATE | (3 << 5);
+}
+
 void idt_set_handler(uint8_t vector, interrupt_handler_t handler)
 {
     handlers[vector] = handler;
@@ -84,6 +91,8 @@ void interrupt_dispatch(struct interrupt_frame *frame)
         else
             pr_warn("unhandled IRQ %u\n", irq);
         pic_eoi(irq);
+        // after the eoi, or the pic would hold back the next tick
+        sched_preempt();
         return;
     }
 
@@ -91,4 +100,5 @@ void interrupt_dispatch(struct interrupt_frame *frame)
         handlers[vec](frame);
     else
         pr_warn("unhandled interrupt vector %lu\n", vec);
+    sched_preempt();
 }

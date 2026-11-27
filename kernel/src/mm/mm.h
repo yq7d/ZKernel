@@ -18,6 +18,9 @@
 #define KSTACK_BASE 0xffffe00000000000UL
 #define KSTACK_LIMIT 0xfffff00000000000UL
 
+// user space: everything below this
+#define USER_LIMIT  0x0000800000000000UL
+
 extern uint64_t hhdm_offset;
 
 static inline void *phys_to_virt(uint64_t phys)

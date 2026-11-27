@@ -8,5 +8,5 @@ uint64_t timer_ticks(void);
 uint64_t timer_uptime_ns(void);
 uint64_t timer_uptime_ms(void);
 
-// needs interrupts enabled
+// blocks the thread once the scheduler runs, before that it halts
 void timer_sleep_ms(uint64_t ms);

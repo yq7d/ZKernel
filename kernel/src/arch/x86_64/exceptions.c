@@ -4,6 +4,7 @@
 #include "kprintf.h"
 #include "mm/vmm.h"
 #include "panic.h"
+#include "sched/sched.h"
 
 static const struct {
     const char *mnemonic;
@@ -79,6 +80,16 @@ void exception_handle(struct interrupt_frame *f)
     if (vec == 3 || vec == 1) {
         pr_info("%s %s at %p\n", mn, name, (void *)f->rip);
         return;
+    }
+
+    // a user program crashing only takes itself down
+    if ((f->cs & 3) == 3) {
+        struct thread *t = thread_current();
+        kprintf("\e[1;31m%s (%lu): %s %s at %p", t->name, t->id, name, mn, (void *)f->rip);
+        if (vec == 14)
+            kprintf(", address %p", (void *)read_cr2());
+        kprintf(", killed\e[0m\n");
+        thread_exit(-(int)vec - 1);
     }
 
     panic_begin();

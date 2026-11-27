@@ -16,6 +16,19 @@ static inline uint64_t read_rflags(void)
     return v;
 }
 
+static inline uint64_t irq_save(void)
+{
+    uint64_t flags = read_rflags();
+    cli();
+    return flags;
+}
+
+static inline void irq_restore(uint64_t flags)
+{
+    if (flags & (1UL << 9))
+        sti();
+}
+
 static inline uint64_t rdmsr(uint32_t msr)
 {
     uint32_t lo, hi;

@@ -5,6 +5,7 @@
 #include "arch/x86_64/io.h"
 #include "arch/x86_64/cpu.h"
 #include "lib/spinlock.h"
+#include "sched/sched.h"
 #include <stdint.h>
 
 #define SC_EXTENDED 0xE0
@@ -43,6 +44,7 @@ static volatile int buf[BUF_SIZE];
 static volatile uint8_t head, tail;    // uint8_t wraps at BUF_SIZE
 
 static bool lshift, rshift, ctrl, alt, caps, extended;
+static struct waitq readers = WAITQ_INIT;
 
 static void push(int c)
 {
@@ -51,6 +53,7 @@ static void push(int c)
         return;    // full, drop it
     buf[head] = c;
     head = next;
+    waitq_wake_all(&readers);
 }
 
 static void handle_extended(uint8_t code, bool released)
@@ -163,16 +166,11 @@ int keyboard_trygetc(void)
 
 int keyboard_getc(void)
 {
-    for (;;) {
-        cli();
-        if (tail != head) {
-            int c = buf[tail];
-            tail++;
-            sti();
-            return c;
-        }
-        // sti only takes effect after the next instruction, so no irq can
-        // slip in between the check and the hlt
-        __asm__ volatile ("sti; hlt");
-    }
+    uint64_t flags = irq_save();
+    while (tail == head)
+        waitq_sleep(&readers);
+    int c = buf[tail];
+    tail++;
+    irq_restore(flags);
+    return c;
 }

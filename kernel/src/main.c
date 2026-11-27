@@ -17,6 +17,8 @@
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "kprintf.h"
+#include "proc/proc.h"
+#include "sched/sched.h"
 #include "shell.h"
 #include "tests/tests.h"
 
@@ -63,6 +65,8 @@ static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;
 
 extern void switch_stack(uint64_t top, void (*fn)(void)) __attribute__((noreturn));
 
+static uint64_t boot_stack;
+
 static void banner(void)
 {
     kprintf("\e[1;34m"
@@ -82,6 +86,11 @@ static void kmain_late(void)
     size_t reclaimed = pmm_reclaim_bootloader(memmap_request.response);
     pr_ok("pmm: reclaimed %zu KiB of bootloader memory\n", reclaimed * PAGE_SIZE >> 10);
 
+    sched_init(boot_stack, KERNEL_STACK_PAGES);
+    pr_ok("sched: running as thread \"%s\"\n", thread_current()->name);
+    syscall_init();
+    pr_ok("syscalls: int 0x80\n");
+
     timer_init(TIMER_HZ);
     pr_ok("timer: pit at %d Hz\n", TIMER_HZ);
     if (keyboard_init())
@@ -93,7 +102,7 @@ static void kmain_late(void)
     pr_ok("interrupts enabled\n");
 
     pr_info("running self-tests...\n");
-    bool ok = test_string() & test_printf() & test_mm() & test_timer();
+    bool ok = test_string() & test_printf() & test_mm() & test_timer() & test_sched() & test_proc();
     if (!ok)
         pr_warn("some self-tests failed\n");
 
@@ -153,7 +162,7 @@ void kmain(void)
     heap_init();
     pr_ok("heap: ready at %p\n", (void *)HEAP_BASE);
 
-    uint64_t stack = vmm_alloc_stack(KERNEL_STACK_PAGES);
-    pr_ok("stack: %u KiB at %p with guard page\n", KERNEL_STACK_PAGES * 4, (void *)stack);
-    switch_stack(stack, kmain_late);
+    boot_stack = vmm_alloc_stack(KERNEL_STACK_PAGES);
+    pr_ok("stack: %u KiB at %p with guard page\n", KERNEL_STACK_PAGES * 4, (void *)boot_stack);
+    switch_stack(boot_stack, kmain_late);
 }

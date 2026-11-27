@@ -2,6 +2,7 @@
 #include "drivers/pit.h"
 #include "arch/x86_64/interrupts.h"
 #include "arch/x86_64/io.h"
+#include "sched/sched.h"
 
 #define PIT_CH0      0x40
 #define PIT_CMD      0x43
@@ -15,6 +16,7 @@ static void timer_irq(struct interrupt_frame *frame)
 {
     (void)frame;
     ticks++;
+    sched_tick();
 }
 
 void timer_init(uint32_t hz)
@@ -50,6 +52,10 @@ uint64_t timer_uptime_ms(void)
 
 void timer_sleep_ms(uint64_t ms)
 {
+    if (sched_running()) {
+        thread_sleep_ms(ms);
+        return;
+    }
     uint64_t target = timer_uptime_ns() + ms * 1000000;
     while (timer_uptime_ns() < target)
         __asm__ volatile ("hlt");

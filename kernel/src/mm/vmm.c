@@ -1,4 +1,5 @@
 #include "mm/vmm.h"
+#include "mm/heap.h"
 #include "mm/mm.h"
 #include "mm/pmm.h"
 #include "arch/x86_64/cpu.h"
@@ -29,6 +30,11 @@ static inline void invlpg(uint64_t virt)
     __asm__ volatile ("invlpg (%0)" : : "r"(virt) : "memory");
 }
 
+static inline uint64_t read_cr3_phys(void)
+{
+    return read_cr3() & PTE_ADDR_MASK;
+}
+
 static uint64_t *next_level(uint64_t *table, size_t index, bool create, uint64_t flags)
 {
     uint64_t e = table[index];
@@ -50,9 +56,9 @@ static uint64_t *next_level(uint64_t *table, size_t index, bool create, uint64_t
     return phys_to_virt(p);
 }
 
-static bool map_page(uint64_t virt, uint64_t phys, uint64_t flags, bool huge)
+static bool map_page(uint64_t *pml4, uint64_t virt, uint64_t phys, uint64_t flags, bool huge)
 {
-    uint64_t *pdpt = next_level(kernel_pml4, (virt >> 39) & 511, true, flags);
+    uint64_t *pdpt = next_level(pml4, (virt >> 39) & 511, true, flags);
     if (!pdpt)
         return false;
     uint64_t *pd = next_level(pdpt, (virt >> 30) & 511, true, flags);
@@ -72,28 +78,46 @@ static bool map_page(uint64_t virt, uint64_t phys, uint64_t flags, bool huge)
     return true;
 }
 
-bool vmm_translate(uint64_t virt, uint64_t *phys)
+// returns the leaf entry, or 0
+static uint64_t walk(uint64_t *pml4, uint64_t virt, uint64_t *phys)
 {
-    uint64_t *t = kernel_pml4;
+    uint64_t *t = pml4;
     for (int shift = 39; shift >= 12; shift -= 9) {
         uint64_t e = t[(virt >> shift) & 511];
         if (!(e & PTE_PRESENT))
-            return false;
+            return 0;
         if (shift == 12 || (e & PTE_HUGE)) {
             uint64_t page_mask = (1UL << shift) - 1;
             if (phys)
                 *phys = (e & PTE_ADDR_MASK & ~page_mask) | (virt & page_mask);
-            return true;
+            return e;
         }
         t = phys_to_virt(e & PTE_ADDR_MASK);
     }
-    return false;
+    return 0;
+}
+
+static uint64_t *pte_of(uint64_t *pml4, uint64_t virt)
+{
+    uint64_t *t = pml4;
+    for (int shift = 39; shift > 12; shift -= 9) {
+        uint64_t e = t[(virt >> shift) & 511];
+        if (!(e & PTE_PRESENT) || (e & PTE_HUGE))
+            return NULL;
+        t = phys_to_virt(e & PTE_ADDR_MASK);
+    }
+    return &t[(virt >> 12) & 511];
+}
+
+bool vmm_translate(uint64_t virt, uint64_t *phys)
+{
+    return walk(kernel_pml4, virt, phys) != 0;
 }
 
 bool vmm_map(uint64_t virt, uint64_t phys, uint64_t flags)
 {
     uint64_t irq = spin_lock_irqsave(&lock);
-    bool ok = map_page(virt, phys, flags, false);
+    bool ok = map_page(kernel_pml4, virt, phys, flags, false);
     if (ok)
         invlpg(virt);
     spin_unlock_irqrestore(&lock, irq);
@@ -103,17 +127,11 @@ bool vmm_map(uint64_t virt, uint64_t phys, uint64_t flags)
 void vmm_unmap(uint64_t virt)
 {
     uint64_t irq = spin_lock_irqsave(&lock);
-    uint64_t *t = kernel_pml4;
-    for (int shift = 39; shift > 12; shift -= 9) {
-        uint64_t e = t[(virt >> shift) & 511];
-        if (!(e & PTE_PRESENT) || (e & PTE_HUGE)) {
-            spin_unlock_irqrestore(&lock, irq);
-            return;
-        }
-        t = phys_to_virt(e & PTE_ADDR_MASK);
+    uint64_t *pte = pte_of(kernel_pml4, virt);
+    if (pte) {
+        *pte = 0;
+        invlpg(virt);
     }
-    t[(virt >> 12) & 511] = 0;
-    invlpg(virt);
     spin_unlock_irqrestore(&lock, irq);
 }
 
@@ -127,12 +145,12 @@ static void map_hhdm_range(uint64_t base, uint64_t length)
     while (phys < end) {
         uint64_t virt = phys + hhdm_offset;
         if (phys % HUGE_SIZE == 0 && end - phys >= HUGE_SIZE) {
-            if (!map_page(virt, phys, flags, true))
+            if (!map_page(kernel_pml4, virt, phys, flags, true))
                 panic("vmm: out of memory mapping hhdm");
             phys += HUGE_SIZE;
             continue;
         }
-        if (!vmm_translate(virt, NULL) && !map_page(virt, phys, flags, false))
+        if (!vmm_translate(virt, NULL) && !map_page(kernel_pml4, virt, phys, flags, false))
             panic("vmm: out of memory mapping hhdm");
         phys += PAGE_SIZE;
     }
@@ -143,7 +161,7 @@ static void map_kernel_range(char *start, char *end, uint64_t flags,
 {
     for (uint64_t v = ALIGN_DOWN((uint64_t)start, PAGE_SIZE);
          v < ALIGN_UP((uint64_t)end, PAGE_SIZE); v += PAGE_SIZE) {
-        if (!map_page(v, v - kernel_virt + kernel_phys, flags, false))
+        if (!map_page(kernel_pml4, v, v - kernel_virt + kernel_phys, flags, false))
             panic("vmm: out of memory mapping the kernel");
     }
 }
@@ -156,7 +174,7 @@ void vmm_init(struct limine_memmap_response *memmap,
         panic("vmm: no memory for the pml4");
     kernel_pml4 = phys_to_virt(kernel_pml4_phys);
 
-    // fill the whole upper half now so every address space can share it later
+    // fill the whole upper half now so every address space can share it
     for (size_t i = 256; i < 512; i++)
         if (!next_level(kernel_pml4, i, true, 0))
             panic("vmm: no memory for kernel page tables");
@@ -201,7 +219,102 @@ uint64_t vmm_alloc_stack(size_t pages)
     return top;
 }
 
+// the virtual range isn't reused, there's plenty of it
+void vmm_free_stack(uint64_t top, size_t pages)
+{
+    for (uint64_t v = top - pages * PAGE_SIZE; v < top; v += PAGE_SIZE) {
+        uint64_t phys;
+        if (vmm_translate(v, &phys)) {
+            vmm_unmap(v);
+            pmm_free(phys);
+        }
+    }
+}
+
 bool vmm_is_guard_page(uint64_t addr)
 {
     return addr >= KSTACK_BASE && addr < next_stack && !vmm_translate(addr, NULL);
+}
+
+struct address_space *vmm_create_space(void)
+{
+    struct address_space *as = kzalloc(sizeof(*as));
+    if (!as)
+        return NULL;
+    as->pml4_phys = pmm_alloc_zeroed();
+    if (!as->pml4_phys) {
+        kfree(as);
+        return NULL;
+    }
+    as->pml4 = phys_to_virt(as->pml4_phys);
+    // the upper half tables are shared, so kernel mappings show up everywhere
+    memcpy(&as->pml4[256], &kernel_pml4[256], 256 * sizeof(uint64_t));
+    return as;
+}
+
+static void free_table(uint64_t *table, int level)
+{
+    for (size_t i = 0; i < 512; i++) {
+        uint64_t e = table[i];
+        if (!(e & PTE_PRESENT))
+            continue;
+        uint64_t phys = e & PTE_ADDR_MASK;
+        if (level > 1 && !(e & PTE_HUGE))
+            free_table(phys_to_virt(phys), level - 1);
+        else
+            pmm_free(phys);    // leaf: a page owned by the space
+    }
+    pmm_free(hhdm_to_phys(table));
+}
+
+void vmm_destroy_space(struct address_space *as)
+{
+    if (!as)
+        return;
+    if (read_cr3_phys() == as->pml4_phys)
+        vmm_activate(NULL);
+
+    for (size_t i = 0; i < 256; i++) {
+        uint64_t e = as->pml4[i];
+        if (e & PTE_PRESENT)
+            free_table(phys_to_virt(e & PTE_ADDR_MASK), 3);
+    }
+    pmm_free(as->pml4_phys);
+    kfree(as);
+}
+
+bool vmm_map_user(struct address_space *as, uint64_t virt, uint64_t phys, uint64_t flags)
+{
+    if (virt >= USER_LIMIT)
+        return false;
+    uint64_t irq = spin_lock_irqsave(&lock);
+    bool ok = map_page(as->pml4, virt, phys, flags | PTE_USER, false);
+    if (ok && read_cr3_phys() == as->pml4_phys)
+        invlpg(virt);
+    spin_unlock_irqrestore(&lock, irq);
+    return ok;
+}
+
+bool vmm_translate_user(struct address_space *as, uint64_t virt, uint64_t *phys)
+{
+    return virt < USER_LIMIT && walk(as->pml4, virt, phys) != 0;
+}
+
+bool vmm_user_range_ok(struct address_space *as, uint64_t addr, size_t len, bool write)
+{
+    if (!as || addr >= USER_LIMIT || len > USER_LIMIT - addr)
+        return false;
+    for (uint64_t p = ALIGN_DOWN(addr, PAGE_SIZE); p < addr + len; p += PAGE_SIZE) {
+        uint64_t e = walk(as->pml4, p, NULL);
+        if (!(e & PTE_USER) || (write && !(e & PTE_WRITE)))
+            return false;
+    }
+    return true;
+}
+
+void vmm_activate(struct address_space *as)
+{
+    uint64_t phys = as ? as->pml4_phys : kernel_pml4_phys;
+    if (read_cr3_phys() != phys)
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(phys) : "memory");
 }
