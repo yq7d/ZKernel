@@ -1,4 +1,5 @@
 // built with the host's gcc -static, runs under the linux layer
+#define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -7,10 +8,14 @@
 #include <sys/syscall.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -239,6 +244,182 @@ static void test_threads(void)
     CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static int send_fd(int sock, int fd)
+{
+    char byte = 'F';
+    struct iovec iov = { &byte, 1 };
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1,
+                        .msg_control = u.buf, .msg_controllen = sizeof u.buf };
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &fd, sizeof fd);
+    return (int)sendmsg(sock, &m, 0);
+}
+
+static int recv_fd(int sock)
+{
+    char byte;
+    struct iovec iov = { &byte, 1 };
+    union { struct cmsghdr h; char buf[CMSG_SPACE(sizeof(int))]; } u;
+    struct msghdr m = { .msg_iov = &iov, .msg_iovlen = 1,
+                        .msg_control = u.buf, .msg_controllen = sizeof u.buf };
+    if (recvmsg(sock, &m, 0) != 1 || byte != 'F')
+        return -1;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    if (!c || c->cmsg_type != SCM_RIGHTS)
+        return -1;
+    int fd;
+    memcpy(&fd, CMSG_DATA(c), sizeof fd);
+    return fd;
+}
+
+static void test_unix(void)
+{
+    // socketpair, both ways, then eof
+    int sv[2];
+    char buf[64];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    CHECK(write(sv[0], "ping", 4) == 4 && read(sv[1], buf, sizeof buf) == 4 && memcmp(buf, "ping", 4) == 0);
+    CHECK(send(sv[1], "pong", 4, 0) == 4 && recv(sv[0], buf, sizeof buf, 0) == 4);
+    CHECK(recv(sv[0], buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    close(sv[1]);
+    CHECK(read(sv[0], buf, sizeof buf) == 0);
+    signal(SIGPIPE, SIG_IGN);
+    CHECK(write(sv[0], "x", 1) == -1 && errno == EPIPE);
+    signal(SIGPIPE, SIG_DFL);
+    close(sv[0]);
+
+    // datagrams keep their boundaries
+    CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    send(sv[0], "one", 3, 0);
+    send(sv[0], "three", 5, 0);
+    CHECK(recv(sv[1], buf, sizeof buf, 0) == 3 && recv(sv[1], buf, sizeof buf, 0) == 5);
+    close(sv[0]);
+    close(sv[1]);
+
+    // a server on a path, a client in another process
+    const char *path = "/tmp/ltest.sock";
+    unlink(path);
+    int srv = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    strcpy(a.sun_path, path);
+    CHECK(srv >= 0 && bind(srv, (struct sockaddr *)&a, sizeof a) == 0);
+    CHECK(bind(socket(AF_UNIX, SOCK_STREAM, 0), (struct sockaddr *)&a, sizeof a) == -1 && errno == EADDRINUSE);
+    CHECK(listen(srv, 8) == 0);
+    struct stat st;
+    CHECK(stat(path, &st) == 0 && S_ISSOCK(st.st_mode));
+    pid_t pid = fork();
+    if (pid == 0) {
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (connect(c, (struct sockaddr *)&a, sizeof a) != 0)
+            _exit(1);
+        // a megabyte, more than the queue holds, so the writer has to wait
+        static char big[1 << 20];
+        for (size_t i = 0; i < sizeof big; i++)
+            big[i] = (char)(i * 7);
+        size_t off = 0;
+        while (off < sizeof big) {
+            ssize_t n = write(c, big + off, sizeof big - off);
+            if (n <= 0)
+                _exit(2);
+            off += (size_t)n;
+        }
+        _exit(0);
+    }
+    struct pollfd pf = { srv, POLLIN, 0 };
+    CHECK(poll(&pf, 1, 2000) == 1 && (pf.revents & POLLIN));
+    int conn = accept4(srv, NULL, NULL, SOCK_CLOEXEC);
+    CHECK(conn >= 0);
+    struct ucred cr;
+    socklen_t crl = sizeof cr;
+    CHECK(getsockopt(conn, SOL_SOCKET, SO_PEERCRED, &cr, &crl) == 0 && cr.pid == pid);
+    static char got[1 << 20];
+    size_t total = 0;
+    ssize_t n;
+    while ((n = read(conn, got + total, sizeof got - total)) > 0)
+        total += (size_t)n;
+    int good = total == sizeof got;
+    for (size_t i = 0; good && i < sizeof got; i++)
+        good = got[i] == (char)(i * 7);
+    CHECK(good);
+    int status;
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(conn);
+    close(srv);
+    // the file stays, but nobody's listening any more
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(connect(c, (struct sockaddr *)&a, sizeof a) == -1 && errno == ECONNREFUSED);
+    close(c);
+    unlink(path);
+    c = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(connect(c, (struct sockaddr *)&a, sizeof a) == -1 && errno == ENOENT);
+    close(c);
+
+    // the abstract namespace, and getsockname
+    srv = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un ab = { .sun_family = AF_UNIX };
+    memcpy(ab.sun_path, "\0ltest-abstract", 15);
+    socklen_t al = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 15);
+    CHECK(bind(srv, (struct sockaddr *)&ab, al) == 0 && listen(srv, 1) == 0);
+    c = socket(AF_UNIX, SOCK_STREAM, 0);
+    CHECK(connect(c, (struct sockaddr *)&ab, al) == 0);
+    conn = accept(srv, NULL, NULL);
+    struct sockaddr_un got_a;
+    socklen_t gl = sizeof got_a;
+    CHECK(conn >= 0 && getsockname(conn, (struct sockaddr *)&got_a, &gl) == 0 &&
+          gl == al && memcmp(got_a.sun_path, ab.sun_path, 15) == 0);
+    close(c);
+    close(conn);
+    close(srv);
+
+    // passing a pipe to another process
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    pid = fork();
+    if (pid == 0) {
+        close(sv[0]);
+        int fd = recv_fd(sv[1]);
+        if (fd < 0)
+            _exit(1);
+        write(fd, "through a passed fd", 19);
+        _exit(0);
+    }
+    close(sv[1]);
+    int p[2];
+    pipe(p);
+    CHECK(send_fd(sv[0], p[1]) == 1);
+    close(p[1]);
+    memset(buf, 0, sizeof buf);
+    CHECK(read(p[0], buf, sizeof buf) == 19 && strcmp(buf, "through a passed fd") == 0);
+    CHECK(waitpid(pid, &status, 0) == pid && WEXITSTATUS(status) == 0);
+    close(p[0]);
+    close(sv[0]);
+
+    // O_NONBLOCK on a pipe
+    pipe(p);
+    fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_NONBLOCK);
+    CHECK(fcntl(p[0], F_GETFL) & O_NONBLOCK);
+    CHECK(read(p[0], buf, 1) == -1 && errno == EAGAIN);
+    close(p[0]);
+    close(p[1]);
+    CHECK(pipe2(p, O_NONBLOCK) == 0 && read(p[0], buf, 1) == -1 && errno == EAGAIN);
+    close(p[0]);
+    close(p[1]);
+
+    // lots of fds at once
+    int many[200], nmany = 0;
+    for (int i = 0; i < 200; i++) {
+        many[i] = dup(1);
+        if (many[i] >= 0)
+            nmany++;
+    }
+    CHECK(nmany == 200);
+    for (int i = 0; i < 200; i++)
+        close(many[i]);
+}
+
 static void test_signals(void)
 {
     // a handler runs, with siginfo, and the fpu state survives it
@@ -432,6 +613,7 @@ int main(int argc, char **argv)
 
     test_signals();
     test_threads();
+    test_unix();
 
     printf("ltest: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

@@ -209,20 +209,13 @@ static int set_fd(struct proc *p, int fd, struct file *f)
     if (p->fds[fd])
         file_put(p->fds[fd]);
     p->fds[fd] = f;
-    p->cloexec &= ~(1U << fd);
+    proc_set_cloexec(p, fd, false);
     return fd;
 }
 
 static int alloc_fd_from(struct proc *p, int min, struct file *f)
 {
-    for (int i = min; i < PROC_MAX_FDS; i++) {
-        if (!p->fds[i]) {
-            p->fds[i] = f;
-            p->cloexec &= ~(1U << i);
-            return i;
-        }
-    }
-    return ZK_EMFILE;
+    return proc_fd_alloc_from(p, f, min);
 }
 
 static int64_t l_openat(int dirfd, uint64_t upath, int flags, uint32_t mode)
@@ -245,7 +238,9 @@ static int64_t l_openat(int dirfd, uint64_t upath, int flags, uint32_t mode)
         return fd;
     }
     if (flags & O_CLOEXEC)
-        me()->cloexec |= 1U << fd;
+        proc_set_cloexec(me(), fd, true);
+    if (flags & O_NONBLOCK)
+        f->flags |= O_NONBLOCK;
     return fd;
 }
 
@@ -256,7 +251,7 @@ static int64_t l_close(int fd)
     if (!f)
         return ZK_EBADF;
     p->fds[fd] = NULL;
-    p->cloexec &= ~(1U << fd);
+    proc_set_cloexec(p, fd, false);
     file_put(f);
     return 0;
 }
@@ -270,6 +265,16 @@ static int64_t l_rw(int fd, uint64_t buf, size_t len, bool write, int64_t off)
         return ZK_EFAULT;
     if (f->v->type == VNODE_DIR && !write)
         return ZK_EISDIR;
+    // O_NONBLOCK on anything that can block: give up if it isn't ready
+    if ((f->flags & O_NONBLOCK) && f->v->ops->poll &&
+        (f->v->type == VNODE_PIPE || f->v->type == VNODE_SOCK || f->v->type == VNODE_DEV)) {
+        uint64_t irq = irq_save();
+        int r = f->v->ops->poll(f->v);
+        irq_restore(irq);
+        int want = write ? POLLOUT | POLLHUP : POLLIN | POLLHUP;
+        if (!(r & want))
+            return ZK_EAGAIN;
+    }
     uint64_t saved = f->off;
     if (off >= 0)
         f->off = (uint64_t)off;
@@ -459,6 +464,7 @@ static int64_t l_ioctl(int fd, unsigned long req, uint64_t arg)
         if (copy_in(&on, arg, 4))
             return ZK_EFAULT;
         sock_set_nonblock(f->v, on != 0);
+        f->flags = on ? f->flags | O_NONBLOCK : f->flags & ~O_NONBLOCK;
         return 0;
     }
     case 0x540E:    // TIOCSCTTY
@@ -486,21 +492,18 @@ static int64_t l_fcntl(int fd, int cmd, uint64_t arg)
             return n;
         file_get(f);
         if (cmd == 1030)
-            p->cloexec |= 1U << n;
+            proc_set_cloexec(p, n, true);
         return n;
     }
     case 1:         // F_GETFD
-        return (p->cloexec >> fd) & 1;
+        return proc_get_cloexec(p, fd);
     case 2:         // F_SETFD
-        if (arg & 1)
-            p->cloexec |= 1U << fd;
-        else
-            p->cloexec &= ~(1U << fd);
+        proc_set_cloexec(p, fd, arg & 1);
         return 0;
     case 3:         // F_GETFL
-        return f->flags & (O_ACCMODE | O_APPEND);
+        return f->flags & (O_ACCMODE | O_APPEND | O_NONBLOCK);
     case 4:         // F_SETFL
-        f->flags = (f->flags & ~O_APPEND) | ((int)arg & O_APPEND);
+        f->flags = (f->flags & ~(O_APPEND | O_NONBLOCK)) | ((int)arg & (O_APPEND | O_NONBLOCK));
         sock_set_nonblock(f->v, arg & O_NONBLOCK);
         return 0;
     default:        // locks and the rest: nothing else runs at the same time anyway
@@ -1211,17 +1214,22 @@ static int64_t l_dup3(int old, int new, int flags)
         return r;
     }
     if (flags & O_CLOEXEC)
-        p->cloexec |= 1U << new;
+        proc_set_cloexec(p, new, true);
     return new;
 }
 
 static int64_t l_pipe2(uint64_t ufds, int flags)
 {
     int64_t r = sys_pipe(ufds);
-    if (r == 0 && (flags & O_CLOEXEC)) {
+    if (r == 0 && (flags & (O_CLOEXEC | O_NONBLOCK))) {
         int fds[2];
         copy_in(fds, ufds, sizeof fds);
-        me()->cloexec |= (1U << fds[0]) | (1U << fds[1]);
+        for (int i = 0; i < 2; i++) {
+            if (flags & O_CLOEXEC)
+                proc_set_cloexec(me(), fds[i], true);
+            if (flags & O_NONBLOCK)
+                fd_file(fds[i])->flags |= O_NONBLOCK;
+        }
     }
     return r;
 }
@@ -1486,6 +1494,7 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 273: return 0;            // set_robust_list
     case 280: return 0;            // utimensat
     case 292: return l_dup3((int)A1, (int)A2, (int)A3);
+    case 288: return linux_socketcall(288, A1, A2, A3, A4, 0, 0);    // accept4
     case 293: return l_pipe2(A1, (int)A2);
     case 302: return l_prlimit((int)A2, A3, A4);
     case 316: return l_renameat((int)A1, A2, (int)A3, A4);

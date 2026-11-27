@@ -519,7 +519,7 @@ int64_t proc_fork(struct interrupt_frame *frame, uint64_t new_rsp, uint64_t chil
     p->parent = me;
     p->cred = me->cred;
     p->abi = me->abi;
-    p->cloexec = me->cloexec;
+    memcpy(p->cloexec, me->cloexec, sizeof p->cloexec);
     p->ctty = me->ctty;
     if (p->ctty)
         vnode_get(p->ctty);
@@ -584,12 +584,12 @@ int proc_exec(const char *path, char **argv, char **envp, void *release)
     strlcpy(me->exe, path, sizeof me->exe);
     // close on exec
     for (int i = 0; i < PROC_MAX_FDS; i++) {
-        if (me->fds[i] && (me->cloexec & (1U << i))) {
+        if (me->fds[i] && proc_get_cloexec(me, i)) {
             file_put(me->fds[i]);
             me->fds[i] = NULL;
         }
     }
-    me->cloexec = 0;
+    memset(me->cloexec, 0, sizeof me->cloexec);
     signal_exec(me, t);
     t->clear_tid = 0;
     t->fs_base = 0;
@@ -931,15 +931,36 @@ void proc_free(struct proc *p)
     kfree(p);
 }
 
-int proc_fd_alloc(struct proc *p, struct file *f)
+int proc_fd_alloc_from(struct proc *p, struct file *f, int min)
 {
-    for (int i = 0; i < PROC_MAX_FDS; i++) {
+    for (int i = min < 0 ? 0 : min; i < PROC_MAX_FDS; i++) {
         if (!p->fds[i]) {
             p->fds[i] = f;
+            proc_set_cloexec(p, i, false);
             return i;
         }
     }
     return ZK_EMFILE;
+}
+
+int proc_fd_alloc(struct proc *p, struct file *f)
+{
+    return proc_fd_alloc_from(p, f, 0);
+}
+
+void proc_set_cloexec(struct proc *p, int fd, bool on)
+{
+    if (fd < 0 || fd >= PROC_MAX_FDS)
+        return;
+    if (on)
+        p->cloexec[fd / 64] |= 1UL << (fd % 64);
+    else
+        p->cloexec[fd / 64] &= ~(1UL << (fd % 64));
+}
+
+bool proc_get_cloexec(struct proc *p, int fd)
+{
+    return fd >= 0 && fd < PROC_MAX_FDS && (p->cloexec[fd / 64] >> (fd % 64)) & 1;
 }
 
 struct file *proc_fd_get(struct proc *p, int fd)

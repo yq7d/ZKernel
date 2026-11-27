@@ -1,6 +1,7 @@
 // ipv4 sockets as files: tcp streams and udp datagrams
 #include "net/net.h"
 #include "net/tcp.h"
+#include "net/unix.h"
 #include "arch/x86_64/cpu.h"
 #include "drivers/tty.h"
 #include "fs/vfs.h"
@@ -113,6 +114,7 @@ void sock_set_nonblock(struct vnode *v, bool on)
 {
     if (v->ops == &sock_ops)
         ((struct sock *)v)->nonblock = on;
+    unix_set_nonblock(v, on);
 }
 
 static void bind_udp(struct sock *s, uint16_t port)
@@ -236,7 +238,7 @@ int64_t sys_socket(int domain, int type)
         return fd;
     }
     if (type & SOCK_CLOEXEC)
-        p->cloexec |= 1U << fd;
+        proc_set_cloexec(p, fd, true);
     return fd;
 }
 
@@ -440,10 +442,22 @@ static int64_t msg(int fd, uint64_t umsg, int flags, bool send)
 int64_t linux_socketcall(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
                          uint64_t a4, uint64_t a5, uint64_t a6)
 {
+    if (nr == 41 && (int)a1 == 1)
+        return unix_socket((int)a2, (int)a3);
+    if (nr == 53)
+        return (int)a1 == 1 ? unix_socketpair((int)a2, (int)a3, a4) : -1000 - 97;
+    if (nr != 41) {
+        struct file *f = proc_fd_get(proc_current(), (int)a1);
+        if (!f)
+            return ZK_EBADF;
+        if (unix_is_socket(f))
+            return unix_call(f, nr, a2, a3, a4, a5, a6);
+    }
     switch (nr) {
     case 41: return (int)a1 == AF_INET ? sys_socket((int)a1, (int)a2) : -1000 - 97;    // EAFNOSUPPORT
     case 42: return sys_connect((int)a1, a2, (uint32_t)a3);
     case 43: return ZK_ENOSYS;    // accept, no listening sockets
+    case 288: return ZK_ENOSYS;
     case 44: return sys_sendto((int)a1, a2, a3, (int)a4, a5, (uint32_t)a6);
     case 45: return sys_recvfrom((int)a1, a2, a3, (int)a4, a5, a6);
     case 46: return msg((int)a1, a2, (int)a3, true);
@@ -453,7 +467,6 @@ int64_t linux_socketcall(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
     case 50: return ZK_ENOSYS;    // listen
     case 51: return sys_getsockname((int)a1, a2, a3, false);
     case 52: return sys_getsockname((int)a1, a2, a3, true);
-    case 53: return ZK_ENOSYS;    // socketpair
     case 54: return 0;            // setsockopt
     case 55: return sock_error((int)a1, a4, a5, a3 == 4 && a2 == 1);
     }

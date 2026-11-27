@@ -8,7 +8,7 @@
 #include "sched/sched.h"
 #include "proc/signal.h"
 
-#define PROC_MAX_FDS  32
+#define PROC_MAX_FDS  256
 #define PROC_MAX_ARGS 64
 #define PROC_MAX_ENV  64
 #define PROC_MAX_ARG_BYTES (32 * 1024)
@@ -28,7 +28,7 @@ struct proc {
     struct zk_cred cred;
     int abi;                   // ABI_ZOS or ABI_LINUX
     struct vnode *ctty;        // controlling terminal, what /dev/tty opens
-    uint32_t cloexec;          // fds closed by exec, one bit each
+    uint64_t cloexec[PROC_MAX_FDS / 64];    // fds closed by exec, one bit each
     char exe[ZK_PATH_MAX];
 
     // signals, see signal.h. changed with interrupts off. the mask and
@@ -124,6 +124,10 @@ int64_t proc_wait(int64_t pid, int *status, int flags);
 void proc_free(struct proc *p);
 
 int proc_fd_alloc(struct proc *p, struct file *f);
+// lowest free fd at or above min
+int proc_fd_alloc_from(struct proc *p, struct file *f, int min);
+void proc_set_cloexec(struct proc *p, int fd, bool on);
+bool proc_get_cloexec(struct proc *p, int fd);
 struct file *proc_fd_get(struct proc *p, int fd);
 
 int proc_snapshot(struct zk_procinfo *out, int max);
