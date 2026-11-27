@@ -1,5 +1,5 @@
 # ZKernel
-A kernel made from scratch. Semi assisted with A.I
+A kernel made from scratch. Semi assisted with A.I (claude is my slave in this)
 ## What is ZKernel?
 originally started in **2023**, it was made simply because I was very bored and was testing my skills of c and ASM. 
 It is now being continued as a side project sometimes receiving updates
