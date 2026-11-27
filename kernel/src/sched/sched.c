@@ -1,11 +1,13 @@
 #include "sched/sched.h"
 #include "arch/x86_64/cpu.h"
+#include "arch/x86_64/fpu.h"
 #include "arch/x86_64/gdt.h"
 #include "drivers/pit.h"
 #include "lib/string.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
 #include "panic.h"
+#include "proc/proc.h"
 
 #define THREAD_STACK_PAGES 16
 #define TIME_SLICE         10    // ticks
@@ -82,14 +84,19 @@ static void schedule(void)
     current = next;
     tss_set_kernel_stack(next->stack_top);
     vmm_activate(next->as);
+    fpu_save(prev->fpu);
+    fpu_restore(next->fpu);
     switch_context(&prev->rsp, next->rsp);
 }
 
 static void free_thread(struct thread *t)
 {
+    if (t->proc)
+        proc_free(t->proc);
     if (t->as)
         vmm_destroy_space(t->as);
     vmm_free_stack(t->stack_top, t->stack_pages);
+    kfree(t->fpu);
     kfree(t);
 }
 
@@ -133,13 +140,20 @@ static struct thread *alloc_thread(const char *name)
     struct thread *t = kzalloc(sizeof(*t));
     if (!t)
         return NULL;
+    t->fpu = kmalloc(sizeof(*t->fpu));
+    if (!t->fpu) {
+        kfree(t);
+        return NULL;
+    }
+    fpu_init_state(t->fpu);
     strlcpy(t->name, name, sizeof t->name);
     t->id = __atomic_fetch_add(&next_id, 1, __ATOMIC_RELAXED);
     return t;
 }
 
 static struct thread *spawn(const char *name, thread_fn fn, void *arg,
-                            bool joinable, struct address_space *as, bool runnable)
+                            bool joinable, struct address_space *as,
+                            struct proc *proc, bool runnable)
 {
     reap();
 
@@ -149,11 +163,13 @@ static struct thread *spawn(const char *name, thread_fn fn, void *arg,
     t->stack_pages = THREAD_STACK_PAGES;
     t->stack_top = vmm_alloc_stack(THREAD_STACK_PAGES);
     if (!t->stack_top) {
+        kfree(t->fpu);
         kfree(t);
         return NULL;
     }
     t->joinable = joinable;
     t->as = as;
+    t->proc = proc;
 
     // frame for switch_context to pop: r15 r14 r13 r12 rbx rbp, then ret
     uint64_t *sp = (uint64_t *)t->stack_top;
@@ -179,14 +195,15 @@ static struct thread *spawn(const char *name, thread_fn fn, void *arg,
 }
 
 struct thread *thread_create_with(const char *name, thread_fn fn, void *arg,
-                                  bool joinable, struct address_space *as)
+                                  bool joinable, struct address_space *as,
+                                  struct proc *proc)
 {
-    return spawn(name, fn, arg, joinable, as, true);
+    return spawn(name, fn, arg, joinable, as, proc, true);
 }
 
 struct thread *thread_create(const char *name, thread_fn fn, void *arg, bool joinable)
 {
-    return thread_create_with(name, fn, arg, joinable, NULL);
+    return thread_create_with(name, fn, arg, joinable, NULL, NULL);
 }
 
 void sched_init(uint64_t stack_top, size_t stack_pages)
@@ -202,7 +219,7 @@ void sched_init(uint64_t stack_top, size_t stack_pages)
     current = boot;
 
     // never on the run queue, schedule() falls back to it
-    idle_thread = spawn("idle", idle_loop, NULL, false, NULL, false);
+    idle_thread = spawn("idle", idle_loop, NULL, false, NULL, NULL, false);
     if (!idle_thread)
         panic("sched: can't create the idle thread");
 
@@ -256,6 +273,17 @@ int thread_join(struct thread *t)
     int code = t->exit_code;
     free_thread(t);
     return code;
+}
+
+void thread_detach(struct thread *t)
+{
+    if (!t->joinable)
+        return;
+    t->joinable = false;
+    if (t->state == THREAD_DEAD) {
+        t->next = zombies;
+        zombies = t;
+    }
 }
 
 void thread_yield(void)

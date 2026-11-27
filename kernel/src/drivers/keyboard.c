@@ -5,6 +5,8 @@
 #include "arch/x86_64/io.h"
 #include "arch/x86_64/cpu.h"
 #include "lib/spinlock.h"
+#include "drivers/tty.h"
+#include "proc/proc.h"
 #include "sched/sched.h"
 #include <stdint.h>
 
@@ -46,8 +48,14 @@ static volatile uint8_t head, tail;    // uint8_t wraps at BUF_SIZE
 static bool lshift, rshift, ctrl, alt, caps, extended;
 static struct waitq readers = WAITQ_INIT;
 
-static void push(int c)
+// irq context
+void keyboard_inject(int c)
 {
+    // killed readers have to notice, the key itself is used up
+    if (c == 3 && tty_ctrl_c()) {
+        waitq_wake_all(&readers);
+        return;
+    }
     uint8_t next = head + 1;
     if (next == tail)
         return;    // full, drop it
@@ -70,18 +78,18 @@ static void handle_extended(uint8_t code, bool released)
         return;
 
     switch (code) {
-    case 0x1C: push('\n'); break;    // keypad enter
-    case 0x35: push('/'); break;     // keypad /
-    case 0x47: push(KEY_HOME); break;
-    case 0x48: push(KEY_UP); break;
-    case 0x49: push(KEY_PGUP); break;
-    case 0x4B: push(KEY_LEFT); break;
-    case 0x4D: push(KEY_RIGHT); break;
-    case 0x4F: push(KEY_END); break;
-    case 0x50: push(KEY_DOWN); break;
-    case 0x51: push(KEY_PGDN); break;
-    case 0x52: push(KEY_INSERT); break;
-    case 0x53: push(KEY_DELETE); break;
+    case 0x1C: keyboard_inject('\n'); break;    // keypad enter
+    case 0x35: keyboard_inject('/'); break;     // keypad /
+    case 0x47: keyboard_inject(KEY_HOME); break;
+    case 0x48: keyboard_inject(KEY_UP); break;
+    case 0x49: keyboard_inject(KEY_PGUP); break;
+    case 0x4B: keyboard_inject(KEY_LEFT); break;
+    case 0x4D: keyboard_inject(KEY_RIGHT); break;
+    case 0x4F: keyboard_inject(KEY_END); break;
+    case 0x50: keyboard_inject(KEY_DOWN); break;
+    case 0x51: keyboard_inject(KEY_PGDN); break;
+    case 0x52: keyboard_inject(KEY_INSERT); break;
+    case 0x53: keyboard_inject(KEY_DELETE); break;
     }
 }
 
@@ -115,11 +123,11 @@ static void handle_scancode(uint8_t sc)
         return;
 
     if (code >= SC_F1 && code <= SC_F10) {
-        push(KEY_F1 + (code - SC_F1));
+        keyboard_inject(KEY_F1 + (code - SC_F1));
         return;
     }
     if (code == SC_F11 || code == SC_F12) {
-        push(KEY_F1 + 10 + (code - SC_F11));
+        keyboard_inject(KEY_F1 + 10 + (code - SC_F11));
         return;
     }
 
@@ -133,7 +141,7 @@ static void handle_scancode(uint8_t sc)
         c = keymap_shift[code];
     if (ctrl && letter)
         c &= 0x1F;
-    push(c);
+    keyboard_inject(c);
 }
 
 static void keyboard_irq(struct interrupt_frame *frame)
@@ -167,8 +175,13 @@ int keyboard_trygetc(void)
 int keyboard_getc(void)
 {
     uint64_t flags = irq_save();
-    while (tail == head)
+    while (tail == head) {
+        if (proc_killed()) {
+            irq_restore(flags);
+            return -1;
+        }
         waitq_sleep(&readers);
+    }
     int c = buf[tail];
     tail++;
     irq_restore(flags);

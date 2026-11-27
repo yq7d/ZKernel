@@ -1,6 +1,8 @@
 // com1, 16550 uart
 #include "drivers/serial.h"
+#include "arch/x86_64/interrupts.h"
 #include "arch/x86_64/io.h"
+#include "drivers/keyboard.h"
 
 #define COM1 0x3F8
 
@@ -54,4 +56,24 @@ void serial_putdec(unsigned long v)
     } while (v);
     while (i--)
         serial_putc(buf[i]);
+}
+
+static void serial_irq(struct interrupt_frame *f)
+{
+    (void)f;
+    while (inb(COM1 + 5) & 1) {
+        int c = inb(COM1);
+        if (c == '\r')
+            c = '\n';
+        else if (c == 0x7f)
+            c = '\b';
+        keyboard_inject(c);
+    }
+}
+
+// serial input shows up as keyboard input
+void serial_enable_input(void)
+{
+    irq_set_handler(4, serial_irq);
+    outb(COM1 + 1, 0x01);    // rx interrupt
 }

@@ -1,22 +1,31 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <limine.h>
+#include <zk/version.h>
 
+#include "arch/x86_64/fpu.h"
 #include "arch/x86_64/gdt.h"
 #include "arch/x86_64/interrupts.h"
 #include "arch/x86_64/io.h"
 #include "arch/x86_64/pic.h"
 #include "cmdline.h"
 #include "console/console.h"
+#include "drivers/blk.h"
 #include "drivers/fb.h"
 #include "drivers/keyboard.h"
+#include "drivers/pci.h"
 #include "drivers/pit.h"
+#include "drivers/virtio_blk.h"
+#include "drivers/rtc.h"
 #include "drivers/serial.h"
+#include "fs/vfs.h"
 #include "mm/heap.h"
 #include "mm/mm.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "kprintf.h"
+#include "drivers/tty.h"
+#include "lib/string.h"
 #include "proc/proc.h"
 #include "sched/sched.h"
 #include "shell.h"
@@ -55,6 +64,12 @@ static volatile struct limine_executable_address_request kaddr_request = {
     .revision = 0,
 };
 
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_module_request module_request = {
+    .id = LIMINE_MODULE_REQUEST_ID,
+    .revision = 0,
+};
+
 __attribute__((used, section(".limine_requests_start")))
 static volatile uint64_t requests_start[] = LIMINE_REQUESTS_START_MARKER;
 
@@ -67,6 +82,54 @@ extern void switch_stack(uint64_t top, void (*fn)(void)) __attribute__((noreturn
 
 static uint64_t boot_stack;
 
+// module memory isn't reclaimed, but the limine structs describing it are
+static const void *initrd_data;
+static size_t initrd_size;
+
+static void find_initrd(void)
+{
+    struct limine_module_response *r = module_request.response;
+    if (!r)
+        return;
+    for (uint64_t i = 0; i < r->module_count; i++) {
+        const char *path = r->modules[i]->path;
+        const char *slash = strrchr(path, '/');
+        if (strcmp(slash ? slash + 1 : path, "initrd.tar") == 0) {
+            initrd_data = r->modules[i]->address;
+            initrd_size = r->modules[i]->size;
+        }
+    }
+}
+
+// runs /bin/sh (or init=) on the console, falling back to the kernel shell
+static void run_init(void)
+{
+    char init[ZK_PATH_MAX] = "/bin/sh";
+    cmdline_get("init", init, sizeof init);
+    if (strcmp(init, "kshell") == 0)
+        return;
+
+    for (int failures = 0; failures < 3; ) {
+        struct spawn_opts o;
+        proc_console_opts(&o);
+        char *argv[] = { init, NULL };
+        int err;
+        uint64_t start = timer_uptime_ms();
+        struct thread *t = proc_spawn(init, argv, proc_default_env, &o, &err);
+        proc_put_console(&o);
+        if (!t) {
+            pr_err("init: can't run %s: %s\n", init, proc_strerror(err));
+            return;
+        }
+        int code = thread_join(t);
+        tty_set_fg(0);
+        pr_warn("init: %s exited with %d, restarting\n", init, code);
+        // something is badly wrong if it keeps dying right away
+        failures = timer_uptime_ms() - start < 1000 ? failures + 1 : 0;
+    }
+    pr_err("init: giving up\n");
+}
+
 static void banner(void)
 {
     kprintf("\e[1;34m"
@@ -76,7 +139,7 @@ static void banner(void)
             "  / /_ | . \\  __/ |  | | | |  __/ |\n"
             " /____||_|\\_\\___|_|  |_| |_|\\___|_|\n"
             "\e[0m\n"
-            "  \e[1mZKernel\e[0m x86_64 - built " __DATE__ " " __TIME__ "\n\n");
+            "  \e[1mZKernel\e[0m " ZK_VERSION " x86_64 - built " __DATE__ " " __TIME__ "\n\n");
 }
 
 // runs on the new kernel stack
@@ -88,11 +151,26 @@ static void kmain_late(void)
 
     sched_init(boot_stack, KERNEL_STACK_PAGES);
     pr_ok("sched: running as thread \"%s\"\n", thread_current()->name);
+
+    vfs_init();
+    if (initrd_data) {
+        int n = initrd_unpack(initrd_data, initrd_size);
+        pr_ok("initrd: %d files, %zu KiB\n", n, initrd_size >> 10);
+    } else {
+        pr_warn("initrd: no initrd.tar module\n");
+    }
     syscall_init();
     pr_ok("syscalls: int 0x80\n");
 
+    pci_init();
+    pr_ok("pci: %d devices\n", pci_count());
+    virtio_blk_init();
+
     timer_init(TIMER_HZ);
     pr_ok("timer: pit at %d Hz\n", TIMER_HZ);
+    rtc_init();
+    pr_ok("rtc: unix time %ld\n", rtc_now());
+    serial_enable_input();
     if (keyboard_init())
         pr_ok("keyboard: ps/2 ready\n");
     else
@@ -102,7 +180,7 @@ static void kmain_late(void)
     pr_ok("interrupts enabled\n");
 
     pr_info("running self-tests...\n");
-    bool ok = test_string() & test_printf() & test_mm() & test_timer() & test_sched() & test_proc();
+    bool ok = test_string() & test_printf() & test_mm() & test_timer() & test_sched() & test_vfs() & test_proc();
     if (!ok)
         pr_warn("some self-tests failed\n");
 
@@ -110,7 +188,17 @@ static void kmain_late(void)
     if (cmdline_get("fault", fault, sizeof fault))
         trigger_fault(fault);
 
+    // the first disk goes on /mnt if it holds a filesystem we know
+    if (blk_count() > 0) {
+        int err = vfs_mount("/dev/vda", "/mnt", "fat");
+        if (err)
+            pr_warn("mount: /dev/vda on /mnt: %s\n", proc_strerror(err));
+        else
+            pr_ok("mount: /dev/vda on /mnt (fat)\n");
+    }
+
     pr_ok("boot complete\n");
+    run_init();
     shell_run();
 }
 
@@ -140,6 +228,8 @@ void kmain(void)
     cmdline_init(cmdline_request.response ? cmdline_request.response->cmdline : "");
     pr_info("command line: \"%s\"\n", cmdline_raw());
 
+    fpu_init();
+    pr_ok("fpu: sse enabled\n");
     gdt_init();
     pr_ok("gdt: kernel/user segments + tss loaded\n");
     pic_init(IRQ_BASE);
@@ -161,6 +251,7 @@ void kmain(void)
 
     heap_init();
     pr_ok("heap: ready at %p\n", (void *)HEAP_BASE);
+    find_initrd();
 
     boot_stack = vmm_alloc_stack(KERNEL_STACK_PAGES);
     pr_ok("stack: %u KiB at %p with guard page\n", KERNEL_STACK_PAGES * 4, (void *)boot_stack);

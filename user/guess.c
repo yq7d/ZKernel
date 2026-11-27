@@ -9,7 +9,8 @@ int main(void)
     for (int tries = 1;; tries++) {
         printf("> ");
         char line[16];
-        readline(line, sizeof line);
+        if (readline(line, sizeof line) < 0)
+            return 1;
         int g = atoi(line);
 
         if (g < target) {

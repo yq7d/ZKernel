@@ -1,11 +1,14 @@
 // tiny built-in shell for poking at the kernel
 #include "shell.h"
 #include "arch/x86_64/cpu.h"
+#include "arch/x86_64/power.h"
 #include "cmdline.h"
 #include "console/console.h"
 #include "drivers/keyboard.h"
 #include "drivers/pit.h"
-#include "drivers/ps2.h"
+#include "drivers/tty.h"
+#include "fs/vfs.h"
+#include "lib/printf.h"
 #include "kprintf.h"
 #include "lib/string.h"
 #include "mm/heap.h"
@@ -96,14 +99,13 @@ static void cmd_crash(int argc, char **argv)
 static void cmd_reboot(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    kprintf("rebooting...\n");
-    ps2_reboot();
+    machine_reboot();
+}
 
-    // controller didn't do it, triple fault instead
-    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) empty = { 0, 0 };
-    __asm__ volatile ("lidt %0; int3" : : "m"(empty));
-    for (;;)
-        __asm__ volatile ("hlt");
+static void cmd_poweroff(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    machine_poweroff();
 }
 
 static void cmd_ps(int argc, char **argv)
@@ -139,11 +141,65 @@ static void cmd_demo(int argc, char **argv)
     kprintf("  all demo threads finished\n");
 }
 
+// relative names are looked up in /bin
+static int resolve(const char *name, char *out)
+{
+    if (!strchr(name, '/')) {
+        char tmp[ZK_PATH_MAX];
+        snprintf(tmp, sizeof tmp, "/bin/%s", name);
+        return vfs_normalize("/", tmp, out);
+    }
+    return vfs_normalize("/", name, out);
+}
+
+static void cmd_ls(int argc, char **argv)
+{
+    char path[ZK_PATH_MAX];
+    int err = vfs_normalize("/", argc > 1 ? argv[1] : "/", path);
+    struct file *f = NULL;
+    if (!err)
+        err = vfs_open(path, O_RDONLY, &f);
+    if (err) {
+        kprintf("ls: %s\n", proc_strerror(err));
+        return;
+    }
+    struct zk_dirent d;
+    while ((err = file_readdir(f, &d)) > 0) {
+        char child[ZK_PATH_MAX];
+        struct zk_stat st = { 0 };
+        snprintf(child, sizeof child, "%s/%s", strcmp(path, "/") ? path : "", d.name);
+        vfs_stat(child, &st);
+        kprintf("  %-20s %s%8lu\n", d.name, d.type == ZK_TYPE_DIR ? "dir " :
+                d.type == ZK_TYPE_DEV ? "dev " : "    ", st.size);
+    }
+    if (err < 0)
+        kprintf("ls: %s\n", proc_strerror(err));
+    file_put(f);
+}
+
+static void cmd_cat(int argc, char **argv)
+{
+    for (int i = 1; i < argc; i++) {
+        char path[ZK_PATH_MAX];
+        void *data;
+        size_t size;
+        int err = vfs_normalize("/", argv[i], path);
+        if (!err)
+            err = vfs_read_all(path, &data, &size, 1 << 20);
+        if (err) {
+            kprintf("cat: %s: %s\n", argv[i], proc_strerror(err));
+            continue;
+        }
+        kprintf("%.*s", (int)size, (const char *)data);
+        kfree(data);
+    }
+}
+
 static void cmd_progs(int argc, char **argv)
 {
     (void)argc; (void)argv;
-    for (const struct program *p = program_list(); p->name; p++)
-        kprintf("  %-8s %zu bytes\n", p->name, p->size);
+    char *args[] = { "ls", "/bin" };
+    cmd_ls(2, args);
 }
 
 // run <prog> [args...] [&]
@@ -157,30 +213,41 @@ static void cmd_run(int argc, char **argv)
     if (background)
         argc--;
 
-    const struct program *p = program_find(argv[1]);
-    if (!p) {
-        kprintf("%s: no such program\n", argv[1]);
+    char path[ZK_PATH_MAX];
+    int err = resolve(argv[1], path);
+    if (err) {
+        kprintf("%s: %s\n", argv[1], proc_strerror(err));
         return;
     }
+
+    struct spawn_opts o;
+    proc_console_opts(&o);
+    o.detached = background;
     // a background process can finish and be freed right away, so grab
     // its id before it gets a chance to run
-    const char *err;
     uint64_t flags = irq_save();
-    struct thread *t = proc_spawn(p, argc - 1, argv + 1, background, &err);
+    char *args[MAX_ARGS + 1];
+    for (int i = 1; i < argc; i++)
+        args[i - 1] = argv[i];
+    args[argc - 1] = NULL;
+    struct thread *t = proc_spawn(path, args, proc_default_env, &o, &err);
     uint64_t id = t ? t->id : 0;
     irq_restore(flags);
+    proc_put_console(&o);
 
     if (!t) {
-        kprintf("%s: %s\n", argv[1], err);
+        kprintf("%s: %s\n", argv[1], proc_strerror(err));
         return;
     }
     if (background) {
-        kprintf("[%lu] %s\n", id, p->name);
+        kprintf("[%lu] %s\n", id, argv[1]);
         return;
     }
+    tty_set_fg(id);
     int code = thread_join(t);
+    tty_set_fg(0);
     if (code)
-        kprintf("%s exited with %d\n", p->name, code);
+        kprintf("%s exited with %d\n", argv[1], code);
 }
 
 static const struct command commands[] = {
@@ -192,11 +259,14 @@ static const struct command commands[] = {
     { "sleep",   "sleep <ms>",                  cmd_sleep },
     { "ps",      "list threads",                cmd_ps },
     { "demo",    "run three threads at once",   cmd_demo },
+    { "ls",      "ls [dir]",                    cmd_ls },
+    { "cat",     "cat <file...>",               cmd_cat },
     { "progs",   "list user programs",          cmd_progs },
     { "run",     "run <prog> [args] [&]",       cmd_run },
     { "cmdline", "kernel command line",         cmd_cmdline },
     { "crash",   "crash <type>, test a fault",  cmd_crash },
     { "reboot",  "reboot the machine",          cmd_reboot },
+    { "poweroff", "turn the machine off",       cmd_poweroff },
     { NULL, NULL, NULL },
 };
 

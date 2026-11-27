@@ -2,6 +2,7 @@
 #include "arch/x86_64/gdt.h"
 #include "arch/x86_64/pic.h"
 #include "kprintf.h"
+#include "proc/proc.h"
 #include "sched/sched.h"
 
 struct idt_entry {
@@ -93,12 +94,14 @@ void interrupt_dispatch(struct interrupt_frame *frame)
         pic_eoi(irq);
         // after the eoi, or the pic would hold back the next tick
         sched_preempt();
-        return;
+    } else {
+        if (handlers[vec])
+            handlers[vec](frame);
+        else
+            pr_warn("unhandled interrupt vector %lu\n", vec);
+        sched_preempt();
     }
 
-    if (handlers[vec])
-        handlers[vec](frame);
-    else
-        pr_warn("unhandled interrupt vector %lu\n", vec);
-    sched_preempt();
+    if ((frame->cs & 3) == 3)
+        proc_check_killed();
 }

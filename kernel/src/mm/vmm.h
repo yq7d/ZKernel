@@ -12,6 +12,7 @@ struct limine_memmap_response;
 #define PTE_PCD     (1UL << 4)
 #define PTE_HUGE    (1UL << 7)
 #define PTE_GLOBAL  (1UL << 8)
+#define PTE_COW     (1UL << 9)    // available bit: read only until written, then copied
 #define PTE_NX      (1UL << 63)
 
 void vmm_init(struct limine_memmap_response *memmap,
@@ -40,5 +41,9 @@ void vmm_destroy_space(struct address_space *as);
 bool vmm_map_user(struct address_space *as, uint64_t virt, uint64_t phys, uint64_t flags);
 bool vmm_translate_user(struct address_space *as, uint64_t virt, uint64_t *phys);
 bool vmm_user_range_ok(struct address_space *as, uint64_t addr, size_t len, bool write);
+// copy on write duplicate of the lower half, for fork
+struct address_space *vmm_clone_space(struct address_space *src);
+// resolves a write to a copy on write page. false if addr isn't one
+bool vmm_cow_fault(struct address_space *as, uint64_t addr);
 // NULL switches back to the kernel-only tables
 void vmm_activate(struct address_space *as);

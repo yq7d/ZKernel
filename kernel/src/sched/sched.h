@@ -22,6 +22,8 @@ struct waitq {
 #define WAITQ_INIT { NULL, NULL }
 
 struct address_space;
+struct proc;
+struct fpu_state;
 
 struct thread {
     uint64_t rsp;
@@ -40,6 +42,8 @@ struct thread {
     struct waitq exit_wq;
 
     struct address_space *as;    // NULL for kernel threads
+    struct proc *proc;           // NULL for kernel threads
+    struct fpu_state *fpu;
 
     struct thread *next;         // run queue, wait queue or sleep list
     struct thread *all_next;
@@ -79,6 +83,9 @@ struct thread_info {
 int sched_snapshot(struct thread_info *out, int max);
 const char *thread_state_name(enum thread_state s);
 
-// used by the process code to finish a new user thread
+// used by the process code to start a new user thread
 struct thread *thread_create_with(const char *name, thread_fn fn, void *arg,
-                                  bool joinable, struct address_space *as);
+                                  bool joinable, struct address_space *as,
+                                  struct proc *proc);
+// interrupts must be off. nobody will join t, it gets freed once dead
+void thread_detach(struct thread *t);

@@ -1,0 +1,7 @@
+#include "zk.h"
+
+int main(void)
+{
+    sync();
+    return 0;
+}

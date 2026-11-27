@@ -4,6 +4,7 @@
 #include "kprintf.h"
 #include "mm/vmm.h"
 #include "panic.h"
+#include "proc/proc.h"
 #include "sched/sched.h"
 
 static const struct {
@@ -76,6 +77,13 @@ void exception_handle(struct interrupt_frame *f)
     const char *mn = exceptions[vec].mnemonic ? exceptions[vec].mnemonic : "---";
     const char *name = exceptions[vec].name ? exceptions[vec].name : "Reserved";
 
+    // write to a copy on write page, from user code or a syscall
+    if (vec == 14 && (f->error_code & 3) == 3) {
+        struct thread *t = thread_current();
+        if (t && t->as && vmm_cow_fault(t->as, read_cr2()))
+            return;
+    }
+
     // #DB and #BP aren't fatal
     if (vec == 3 || vec == 1) {
         pr_info("%s %s at %p\n", mn, name, (void *)f->rip);
@@ -89,7 +97,8 @@ void exception_handle(struct interrupt_frame *f)
         if (vec == 14)
             kprintf(", address %p", (void *)read_cr2());
         kprintf(", killed\e[0m\n");
-        thread_exit(-(int)vec - 1);
+        sti();
+        proc_exit(128 + (int)vec);
     }
 
     panic_begin();

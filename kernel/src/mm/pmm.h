@@ -15,7 +15,10 @@ uint64_t pmm_alloc(void);
 uint64_t pmm_alloc_zeroed(void);
 uint64_t pmm_alloc_pages(size_t count);    // physically contiguous
 
+// drops one reference, the page is freed with the last one
 void pmm_free(uint64_t phys);
+void pmm_ref(uint64_t phys);
+unsigned pmm_refcount(uint64_t phys);
 void pmm_free_pages(uint64_t phys, size_t count);
 
 size_t pmm_total_pages(void);

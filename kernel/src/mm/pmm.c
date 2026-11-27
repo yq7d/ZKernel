@@ -11,6 +11,7 @@
 #define LOW_MEMORY_END 0x100000    // keep the first 1MiB for real mode stuff later
 
 static uint8_t *bitmap;
+static uint16_t *refs;             // per page, for pages shared copy on write
 static size_t page_count;          // pages covered by the bitmap
 static size_t total_pages;         // usable pages
 static size_t free_pages;
@@ -47,7 +48,8 @@ void pmm_init(struct limine_memmap_response *memmap)
     }
 
     page_count = top / PAGE_SIZE;
-    size_t bitmap_size = ALIGN_UP((page_count + 7) / 8, PAGE_SIZE);
+    size_t bitmap_bytes = ALIGN_UP((page_count + 7) / 8, 16);
+    size_t bitmap_size = ALIGN_UP(bitmap_bytes + page_count * sizeof(uint16_t), PAGE_SIZE);
 
     uint64_t bitmap_phys = 0;
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
@@ -62,7 +64,9 @@ void pmm_init(struct limine_memmap_response *memmap)
         panic("pmm: no region big enough for the %zu byte bitmap", bitmap_size);
 
     bitmap = phys_to_virt(bitmap_phys);
-    memset(bitmap, 0xFF, bitmap_size);
+    memset(bitmap, 0xFF, bitmap_bytes);
+    refs = (uint16_t *)(bitmap + bitmap_bytes);
+    memset(refs, 0, page_count * sizeof(uint16_t));
 
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry *e = memmap->entries[i];
@@ -94,6 +98,7 @@ uint64_t pmm_alloc(void)
         }
         if (!page_used(i)) {
             mark_used(i);
+            refs[i] = 1;
             free_pages--;
             next_hint = i + 1;
             result = (uint64_t)i * PAGE_SIZE;
@@ -129,8 +134,10 @@ uint64_t pmm_alloc_pages(size_t count)
         }
         if (++run == count) {
             size_t start = i + 1 - count;
-            for (size_t p = start; p <= i; p++)
+            for (size_t p = start; p <= i; p++) {
                 mark_used(p);
+                refs[p] = 1;
+            }
             free_pages -= count;
             result = (uint64_t)start * PAGE_SIZE;
             break;
@@ -151,6 +158,12 @@ void pmm_free(uint64_t phys)
         spin_unlock_irqrestore(&lock, flags);
         panic("pmm: double free of %#lx", phys);
     }
+    if (refs[i] > 1) {
+        refs[i]--;
+        spin_unlock_irqrestore(&lock, flags);
+        return;
+    }
+    refs[i] = 0;
     mark_free(i);
     free_pages++;
     if (i < next_hint)
@@ -212,4 +225,20 @@ size_t pmm_total_pages(void)
 size_t pmm_free_count(void)
 {
     return free_pages;
+}
+
+void pmm_ref(uint64_t phys)
+{
+    size_t i = phys / PAGE_SIZE;
+    uint64_t flags = spin_lock_irqsave(&lock);
+    if (i >= page_count || !page_used(i) || refs[i] == UINT16_MAX)
+        panic("pmm: bad ref of %#lx", phys);
+    refs[i]++;
+    spin_unlock_irqrestore(&lock, flags);
+}
+
+unsigned pmm_refcount(uint64_t phys)
+{
+    size_t i = phys / PAGE_SIZE;
+    return i < page_count ? refs[i] : 0;
 }
