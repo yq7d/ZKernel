@@ -1,4 +1,4 @@
-/* gcc can emit calls to the mem* functions even with -ffreestanding */
+// gcc can emit calls to the mem* functions even with -ffreestanding
 #include "lib/string.h"
 #include <stdint.h>
 
@@ -26,7 +26,7 @@ void *memmove(void *dst, const void *src, size_t n)
     if (d <= s || d >= s + n)
         return memcpy(dst, src, n);
 
-    /* overlapping, copy backwards */
+    // overlapping, copy backwards
     d += n - 1;
     s += n - 1;
     __asm__ volatile ("std; rep movsb; cld"

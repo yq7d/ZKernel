@@ -1,6 +1,8 @@
 #include "console/console.h"
 #include "console/font.h"
 #include "drivers/fb.h"
+#include "lib/spinlock.h"
+#include "panic.h"
 
 static const uint32_t palette[16] = {
     0x1d1f21, 0xcc6666, 0x8cb867, 0xe0b05a, 0x5f8fd0, 0xb07fcf, 0x5fb3b3, 0xc5c8c6,
@@ -23,7 +25,24 @@ static struct {
     enum { ST_NORMAL, ST_ESC, ST_CSI } state;
     uint32_t params[MAX_PARAMS];
     uint32_t nparams;
+
+    bool cursor_drawn;
+    uint32_t cursor_x, cursor_y;
 } con;
+
+static spinlock_t lock = SPINLOCK_INIT;
+
+// the panic path must still be able to print if it interrupted a holder
+static uint64_t lock_console(void)
+{
+    return panic_in_progress() ? read_rflags() : spin_lock_irqsave(&lock);
+}
+
+static void unlock_console(uint64_t flags)
+{
+    if (!panic_in_progress())
+        spin_unlock_irqrestore(&lock, flags);
+}
 
 static void update_colors(void)
 {
@@ -48,8 +67,8 @@ bool console_init(void)
     con.bright = false;
     con.state = ST_NORMAL;
     update_colors();
+    fb_clear(con.bg);
     con.ready = true;
-    console_clear();
     return true;
 }
 
@@ -58,10 +77,62 @@ bool console_ready(void)
     return con.ready;
 }
 
-void console_clear(void)
+static void clear_locked(void)
 {
     fb_clear(con.bg);
     con.cx = con.cy = 0;
+    con.cursor_drawn = false;
+}
+
+void console_clear(void)
+{
+    uint64_t f = lock_console();
+    clear_locked();
+    unlock_console(f);
+}
+
+// inverting twice restores the cell, so no copy of the screen is needed
+static void invert_cell(uint32_t col, uint32_t row)
+{
+    const struct font *f = &con.font;
+    uint32_t mask = fb_rgb(0xFFFFFF);
+    for (uint32_t y = 0; y < f->height; y++) {
+        uint32_t *line = (uint32_t *)(fb.addr + (size_t)(row * f->height + y) * fb.pitch)
+                       + col * f->width;
+        for (uint32_t x = 0; x < f->width; x++)
+            line[x] ^= mask;
+    }
+}
+
+static void cursor_hide_locked(void)
+{
+    if (con.cursor_drawn) {
+        invert_cell(con.cursor_x, con.cursor_y);
+        con.cursor_drawn = false;
+    }
+}
+
+void console_cursor_show(void)
+{
+    if (!con.ready)
+        return;
+    uint64_t f = lock_console();
+    if (!con.cursor_drawn && con.cx < con.cols) {
+        con.cursor_x = con.cx;
+        con.cursor_y = con.cy;
+        invert_cell(con.cursor_x, con.cursor_y);
+        con.cursor_drawn = true;
+    }
+    unlock_console(f);
+}
+
+void console_cursor_hide(void)
+{
+    if (!con.ready)
+        return;
+    uint64_t f = lock_console();
+    cursor_hide_locked();
+    unlock_console(f);
 }
 
 static void draw_char(uint32_t col, uint32_t row, unsigned char c)
@@ -128,7 +199,7 @@ static void handle_csi(char final)
         break;
     case 'J':
         if (con.nparams && con.params[0] == 2)
-            console_clear();
+            clear_locked();
         break;
     case 'H': {
         uint32_t r = con.nparams > 0 && con.params[0] ? con.params[0] - 1 : 0;
@@ -142,11 +213,8 @@ static void handle_csi(char final)
     }
 }
 
-void console_putc(char ch)
+static void putc_locked(char ch)
 {
-    if (!con.ready)
-        return;
-
     unsigned char c = (unsigned char)ch;
 
     switch (con.state) {
@@ -192,7 +260,7 @@ void console_putc(char ch)
         return;
     case '\t':
         do {
-            console_putc(' ');
+            putc_locked(' ');
         } while (con.cx % 8);
         return;
     case '\b':
@@ -209,8 +277,23 @@ void console_putc(char ch)
     draw_char(con.cx++, con.cy, c);
 }
 
+void console_putc(char c)
+{
+    if (!con.ready)
+        return;
+    uint64_t f = lock_console();
+    cursor_hide_locked();
+    putc_locked(c);
+    unlock_console(f);
+}
+
 void console_write(const char *s, size_t n)
 {
+    if (!con.ready)
+        return;
+    uint64_t f = lock_console();
+    cursor_hide_locked();
     while (n--)
-        console_putc(*s++);
+        putc_locked(*s++);
+    unlock_console(f);
 }

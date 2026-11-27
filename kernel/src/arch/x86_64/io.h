@@ -13,7 +13,7 @@ static inline uint8_t inb(uint16_t port)
     return ret;
 }
 
-/* write to an unused port, ~1us delay for slow hardware like the pic */
+// write to an unused port, ~1us delay for slow hardware like the pic
 static inline void io_wait(void)
 {
     outb(0x80, 0);

@@ -2,6 +2,10 @@
 #include "console/console.h"
 #include "drivers/serial.h"
 #include "lib/printf.h"
+#include "lib/spinlock.h"
+
+// keeps whole messages together
+static spinlock_t lock = SPINLOCK_INIT;
 
 static void kputc(char c, void *ctx)
 {
@@ -12,7 +16,13 @@ static void kputc(char c, void *ctx)
 
 int kvprintf(const char *fmt, va_list ap)
 {
-    return kvformat(kputc, NULL, fmt, ap);
+    if (panic_in_progress())
+        return kvformat(kputc, NULL, fmt, ap);
+
+    uint64_t flags = spin_lock_irqsave(&lock);
+    int n = kvformat(kputc, NULL, fmt, ap);
+    spin_unlock_irqrestore(&lock, flags);
+    return n;
 }
 
 int kprintf(const char *fmt, ...)

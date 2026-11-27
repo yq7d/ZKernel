@@ -1,4 +1,4 @@
-/* com1, 16550 uart */
+// com1, 16550 uart
 #include "drivers/serial.h"
 #include "arch/x86_64/io.h"
 
@@ -6,13 +6,13 @@
 
 bool serial_init(void)
 {
-    outb(COM1 + 1, 0x00); /* no interrupts */
-    outb(COM1 + 3, 0x80); /* dlab */
-    outb(COM1 + 0, 0x01); /* 115200 baud */
+    outb(COM1 + 1, 0x00); // no interrupts
+    outb(COM1 + 3, 0x80); // dlab
+    outb(COM1 + 0, 0x01); // 115200 baud
     outb(COM1 + 1, 0x00);
-    outb(COM1 + 3, 0x03); /* 8n1 */
-    outb(COM1 + 2, 0xC7); /* fifo */
-    outb(COM1 + 4, 0x1E); /* loopback test */
+    outb(COM1 + 3, 0x03); // 8n1
+    outb(COM1 + 2, 0xC7); // fifo
+    outb(COM1 + 4, 0x1E); // loopback test
 
     outb(COM1 + 0, 0xAE);
     if (inb(COM1 + 0) != 0xAE)

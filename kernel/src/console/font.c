@@ -34,7 +34,7 @@ static void map_identity(struct font *f)
         f->map[i] = i < f->glyph_count ? i : '?';
 }
 
-/* ucs-2 entries per glyph, 0xFFFF terminated. sequences are skipped */
+// ucs-2 entries per glyph, 0xFFFF terminated. sequences are skipped
 static void parse_psf1_table(struct font *f, const uint8_t *p, const uint8_t *end)
 {
     for (uint32_t glyph = 0; glyph < f->glyph_count && p + 2 <= end; glyph++) {
@@ -48,7 +48,7 @@ static void parse_psf1_table(struct font *f, const uint8_t *p, const uint8_t *en
     }
 }
 
-/* same but utf-8 */
+// same but utf-8
 static void parse_psf2_table(struct font *f, const uint8_t *p, const uint8_t *end)
 {
     for (uint32_t glyph = 0; glyph < f->glyph_count && p < end; glyph++) {

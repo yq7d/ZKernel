@@ -18,7 +18,7 @@ struct idtr {
     uint64_t base;
 } __attribute__((packed));
 
-/* present, dpl 0, interrupt gate (clears IF) */
+// present, dpl 0, interrupt gate (clears IF)
 #define IDT_INTERRUPT_GATE 0x8E
 
 static struct idt_entry idt[256];
@@ -43,7 +43,7 @@ void idt_init(void)
     for (int v = 0; v < 256; v++)
         idt_set_gate((uint8_t)v, isr_stub_table[v], IDT_INTERRUPT_GATE, 0);
 
-    /* own stacks so these still work if the kernel stack is bad */
+    // own stacks so these still work if the kernel stack is bad
     idt[8].ist  = IST_DOUBLE_FAULT;
     idt[2].ist  = IST_NMI;
     idt[18].ist = IST_MACHINE_CHECK;

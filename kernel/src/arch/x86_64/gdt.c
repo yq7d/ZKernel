@@ -16,7 +16,7 @@ struct gdtr {
     uint64_t base;
 } __attribute__((packed));
 
-/* access byte */
+// access byte
 #define SEG_PRESENT   0x80
 #define SEG_DPL(n)    ((n) << 5)
 #define SEG_CODE_DATA 0x10
@@ -24,7 +24,7 @@ struct gdtr {
 #define SEG_RW        0x02
 #define SEG_TSS_AVAIL 0x09
 
-/* flags */
+// flags
 #define SEG_GRAN_4K   0x8
 #define SEG_32BIT     0x4
 #define SEG_LONG      0x2
@@ -39,7 +39,7 @@ static uint8_t rsp0_stack[STACK_SIZE] __attribute__((aligned(16)));
 
 extern void gdt_load(const struct gdtr *gdtr, uint16_t code_sel, uint16_t data_sel);
 
-/* base/limit are ignored in long mode, filled in anyway */
+// base/limit are ignored in long mode, filled in anyway
 static uint64_t make_segment(uint8_t access, uint8_t flags)
 {
     return 0xFFFFULL
@@ -65,7 +65,7 @@ void gdt_init(void)
     tss.rsp[0] = (uint64_t)&rsp0_stack[STACK_SIZE];
     tss.iopb_offset = sizeof(tss);
 
-    /* tss descriptor takes two slots */
+    // tss descriptor takes two slots
     uint64_t base = (uint64_t)&tss;
     uint64_t limit = sizeof(tss) - 1;
     gdt[5] = (limit & 0xFFFF)

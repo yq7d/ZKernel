@@ -61,7 +61,7 @@ bool test_printf(void)
     CHECK("123456789", "%zu", (size_t)123456789);
     CHECK("%q", "%q");
 
-    /* truncation */
+    // truncation
     char small[4];
     int n = snprintf(small, sizeof small, "%s", "abcdef");
     if (n == 6 && strcmp(small, "abc") == 0) {

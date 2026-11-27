@@ -1,10 +1,10 @@
 #pragma once
 #include <stdint.h>
 
-/* 0-31 exceptions, 32-47 pic irqs */
+// 0-31 exceptions, 32-47 pic irqs
 #define IRQ_BASE 32
 
-/* matches the push order in isr.asm */
+// matches the push order in isr.asm
 struct interrupt_frame {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;

@@ -16,14 +16,14 @@ void pic_init(uint8_t vector_base)
 {
     outb(PIC1_CMD, ICW1_INIT | ICW1_ICW4); io_wait();
     outb(PIC2_CMD, ICW1_INIT | ICW1_ICW4); io_wait();
-    outb(PIC1_DATA, vector_base);          io_wait();  /* IRQ 0-7  */
-    outb(PIC2_DATA, vector_base + 8);      io_wait();  /* IRQ 8-15 */
-    outb(PIC1_DATA, 1 << 2);               io_wait();  /* slave on IRQ2 */
-    outb(PIC2_DATA, 2);                    io_wait();  /* slave identity */
+    outb(PIC1_DATA, vector_base);          io_wait();  // IRQ 0-7
+    outb(PIC2_DATA, vector_base + 8);      io_wait();  // IRQ 8-15
+    outb(PIC1_DATA, 1 << 2);               io_wait();  // slave on IRQ2
+    outb(PIC2_DATA, 2);                    io_wait();  // slave identity
     outb(PIC1_DATA, ICW4_8086);            io_wait();
     outb(PIC2_DATA, ICW4_8086);            io_wait();
 
-    /* mask everything but the cascade line */
+    // mask everything but the cascade line
     outb(PIC1_DATA, 0xFF & ~(1 << 2));
     outb(PIC2_DATA, 0xFF);
 }
@@ -47,7 +47,7 @@ void pic_eoi(uint8_t irq)
     outb(PIC1_CMD, PIC_EOI);
 }
 
-/* irq 7/15 can be spurious, real ones have their ISR bit set */
+// irq 7/15 can be spurious, real ones have their ISR bit set
 bool pic_is_spurious(uint8_t irq)
 {
     if (irq == 7) {
@@ -57,7 +57,7 @@ bool pic_is_spurious(uint8_t irq)
     if (irq == 15) {
         outb(PIC2_CMD, OCW3_READ_ISR);
         if (!(inb(PIC2_CMD) & 0x80)) {
-            outb(PIC1_CMD, PIC_EOI);    /* master still needs one */
+            outb(PIC1_CMD, PIC_EOI);    // master still needs one
             return true;
         }
     }

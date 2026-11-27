@@ -2,6 +2,7 @@
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/io.h"
 #include "kprintf.h"
+#include "mm/vmm.h"
 #include "panic.h"
 
 static const struct {
@@ -37,7 +38,7 @@ static const struct {
 
 static void explain_page_fault(uint64_t err)
 {
-    /* P W U RSVD I */
+    // P W U RSVD I
     kprintf("  faulting address (CR2): %p\n", (void *)read_cr2());
     kprintf("  cause: %s %s %s mode%s\n",
             (err & 0x10) ? "instruction fetch from" : (err & 0x2) ? "write to" : "read from",
@@ -74,7 +75,7 @@ void exception_handle(struct interrupt_frame *f)
     const char *mn = exceptions[vec].mnemonic ? exceptions[vec].mnemonic : "---";
     const char *name = exceptions[vec].name ? exceptions[vec].name : "Reserved";
 
-    /* #DB and #BP aren't fatal */
+    // #DB and #BP aren't fatal
     if (vec == 3 || vec == 1) {
         pr_info("%s %s at %p\n", mn, name, (void *)f->rip);
         return;
@@ -87,6 +88,10 @@ void exception_handle(struct interrupt_frame *f)
         explain_page_fault(f->error_code);
     else if (vec == 10 || vec == 11 || vec == 12 || vec == 13)
         explain_selector_error(f->error_code);
+
+    // a #DF from a stack overflow still has the #PF address in cr2
+    if ((vec == 14 || vec == 8) && vmm_is_guard_page(read_cr2()))
+        kprintf("  \e[1;33mkernel stack overflow (hit guard page %p)\e[0m\n", (void *)read_cr2());
 
     kprintf("  in %s mode\n", (f->cs & 3) ? "user" : "kernel");
     dump_registers(f);

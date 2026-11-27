@@ -1,5 +1,5 @@
 #pragma once
-/* %d %i %u %x %X %o %b %p %c %s %%, flags -0+ #, width/precision, hh h l ll z t j */
+// %d %i %u %x %X %o %b %p %c %s %%, flags -0+ #, width/precision, hh h l ll z t j
 #include <stdarg.h>
 #include <stddef.h>
 

@@ -9,6 +9,11 @@
 
 static volatile int panicking;
 
+bool panic_in_progress(void)
+{
+    return panicking != 0;
+}
+
 void panic_begin(void)
 {
     __asm__ volatile ("cli");
@@ -21,7 +26,7 @@ void panic_begin(void)
     kprintf("\n\e[1;41;37m KERNEL PANIC \e[0m ");
 }
 
-/* needs -fno-omit-frame-pointer. [rbp] = prev rbp, [rbp+8] = return addr */
+// needs -fno-omit-frame-pointer. [rbp] = prev rbp, [rbp+8] = return addr
 void print_backtrace(uint64_t rbp)
 {
     kprintf("  backtrace:\n");

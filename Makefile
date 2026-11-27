@@ -19,7 +19,7 @@ AS      := nasm
 # no sse/fpu (state isn't saved on interrupts yet), no red zone
 CFLAGS  := -std=gnu11 -O2 -g -Wall -Wextra \
            -ffreestanding -fno-stack-protector -fno-stack-check \
-           -fno-PIC -fno-lto -fno-omit-frame-pointer \
+           -fno-PIC -fno-lto -fno-omit-frame-pointer -fstack-clash-protection \
            -m64 -march=x86-64 -mno-80387 -mno-mmx -mno-sse -mno-sse2 \
            -mno-red-zone -mcmodel=kernel \
            -Ikernel/include -Ikernel/src -MMD -MP

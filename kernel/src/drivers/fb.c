@@ -6,7 +6,7 @@ struct framebuffer fb;
 
 bool fb_init(struct limine_framebuffer *lfb)
 {
-    /* only 32bpp rgb for now */
+    // only 32bpp rgb for now
     if (lfb->bpp != 32 || lfb->memory_model != LIMINE_FRAMEBUFFER_RGB)
         return false;
 

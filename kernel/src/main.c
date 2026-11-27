@@ -9,8 +9,15 @@
 #include "cmdline.h"
 #include "console/console.h"
 #include "drivers/fb.h"
+#include "drivers/keyboard.h"
+#include "drivers/pit.h"
 #include "drivers/serial.h"
+#include "mm/heap.h"
+#include "mm/mm.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
 #include "kprintf.h"
+#include "shell.h"
 #include "tests/tests.h"
 
 __attribute__((used, section(".limine_requests")))
@@ -28,11 +35,33 @@ static volatile struct limine_executable_cmdline_request cmdline_request = {
     .revision = 0,
 };
 
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_memmap_request memmap_request = {
+    .id = LIMINE_MEMMAP_REQUEST_ID,
+    .revision = 0,
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_hhdm_request hhdm_request = {
+    .id = LIMINE_HHDM_REQUEST_ID,
+    .revision = 0,
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_executable_address_request kaddr_request = {
+    .id = LIMINE_EXECUTABLE_ADDRESS_REQUEST_ID,
+    .revision = 0,
+};
+
 __attribute__((used, section(".limine_requests_start")))
 static volatile uint64_t requests_start[] = LIMINE_REQUESTS_START_MARKER;
 
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;
+
+#define KERNEL_STACK_PAGES 16
+
+extern void switch_stack(uint64_t top, void (*fn)(void)) __attribute__((noreturn));
 
 static void banner(void)
 {
@@ -44,6 +73,36 @@ static void banner(void)
             " /____||_|\\_\\___|_|  |_| |_|\\___|_|\n"
             "\e[0m\n"
             "  \e[1mZKernel\e[0m x86_64 - built " __DATE__ " " __TIME__ "\n\n");
+}
+
+// runs on the new kernel stack
+static void kmain_late(void)
+{
+    // the old stack and everything limine handed over are now unused
+    size_t reclaimed = pmm_reclaim_bootloader(memmap_request.response);
+    pr_ok("pmm: reclaimed %zu KiB of bootloader memory\n", reclaimed * PAGE_SIZE >> 10);
+
+    timer_init(TIMER_HZ);
+    pr_ok("timer: pit at %d Hz\n", TIMER_HZ);
+    if (keyboard_init())
+        pr_ok("keyboard: ps/2 ready\n");
+    else
+        pr_warn("keyboard: no ps/2 controller found\n");
+
+    __asm__ volatile ("sti");
+    pr_ok("interrupts enabled\n");
+
+    pr_info("running self-tests...\n");
+    bool ok = test_string() & test_printf() & test_mm() & test_timer();
+    if (!ok)
+        pr_warn("some self-tests failed\n");
+
+    char fault[16];
+    if (cmdline_get("fault", fault, sizeof fault))
+        trigger_fault(fault);
+
+    pr_ok("boot complete\n");
+    shell_run();
 }
 
 void kmain(void)
@@ -79,15 +138,22 @@ void kmain(void)
     idt_init();
     pr_ok("idt: 256 vectors installed\n");
 
-    pr_info("running self-tests...\n");
-    bool ok = test_string() & test_printf();
-    if (!ok)
-        pr_warn("some self-tests failed\n");
+    if (!memmap_request.response || !hhdm_request.response || !kaddr_request.response)
+        panic("missing memory map / hhdm / kernel address from bootloader");
+    hhdm_offset = hhdm_request.response->offset;
 
-    char fault[16];
-    if (cmdline_get("fault", fault, sizeof fault))
-        trigger_fault(fault);
+    pmm_init(memmap_request.response);
+    pr_ok("pmm: %zu MiB usable, %zu MiB free\n",
+          pmm_total_pages() * PAGE_SIZE >> 20, pmm_free_count() * PAGE_SIZE >> 20);
 
-    pr_ok("boot complete, halting.\n");
-    hcf();
+    vmm_init(memmap_request.response, kaddr_request.response->physical_base,
+             kaddr_request.response->virtual_base);
+    pr_ok("vmm: own page tables loaded\n");
+
+    heap_init();
+    pr_ok("heap: ready at %p\n", (void *)HEAP_BASE);
+
+    uint64_t stack = vmm_alloc_stack(KERNEL_STACK_PAGES);
+    pr_ok("stack: %u KiB at %p with guard page\n", KERNEL_STACK_PAGES * 4, (void *)stack);
+    switch_stack(stack, kmain_late);
 }

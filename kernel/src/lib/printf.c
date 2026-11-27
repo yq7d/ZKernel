@@ -6,7 +6,7 @@
 struct spec {
     bool left, zero, plus, space, alt;
     int width;
-    int prec;       /* -1 if unset */
+    int prec;       // -1 if unset
 };
 
 struct sink {
