@@ -13,7 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/select.h>
+#include <sys/signalfd.h>
+#include <sys/time.h>
+#include <sys/timerfd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -420,6 +426,152 @@ static void test_unix(void)
         close(many[i]);
 }
 
+static volatile int alarms;
+static void on_alarm(int sig) { (void)sig; alarms++; }
+
+static void test_events(void)
+{
+    // eventfd counts up and reads back the total
+    int e = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    uint64_t v = 3;
+    CHECK(e >= 0 && write(e, &v, 8) == 8 && write(e, &v, 8) == 8);
+    CHECK(read(e, &v, 8) == 8 && v == 6);
+    CHECK(read(e, &v, 8) == -1 && errno == EAGAIN);
+
+    // timerfd ticks
+    int t = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
+    struct itimerspec its = { { 0, 20 * 1000000 }, { 0, 20 * 1000000 } };
+    CHECK(t >= 0 && timerfd_settime(t, 0, &its, NULL) == 0);
+    usleep(110000);
+    CHECK(read(t, &v, 8) == 8 && v >= 3 && v <= 7);
+
+    // epoll over a pipe, the eventfd and the timer
+    int p[2];
+    pipe(p);
+    int ep = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event ev = { .events = EPOLLIN, .data.u32 = 1 };
+    CHECK(ep >= 0 && epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &ev) == 0);
+    ev.data.u32 = 2;
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, e, &ev) == 0);
+    ev.data.u32 = 3;
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, t, &ev) == 0);
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, e, &ev) == -1 && errno == EEXIST);
+    struct epoll_event got[8];
+    read(t, &v, 8);
+    its.it_interval.tv_nsec = 0;
+    its.it_value.tv_nsec = 30 * 1000000;
+    timerfd_settime(t, 0, &its, NULL);
+    // only the timer, after it fires
+    int n = epoll_wait(ep, got, 8, 1000);
+    CHECK(n == 1 && got[0].data.u32 == 3);
+    read(t, &v, 8);
+    CHECK(epoll_wait(ep, got, 8, 0) == 0);
+    write(p[1], "x", 1);
+    v = 1;
+    write(e, &v, 8);
+    n = epoll_wait(ep, got, 8, 1000);
+    int seen = 0;
+    for (int i = 0; i < n; i++)
+        seen |= 1 << got[i].data.u32;
+    CHECK(n == 2 && seen == ((1 << 1) | (1 << 2)));
+    CHECK(epoll_ctl(ep, EPOLL_CTL_DEL, p[0], NULL) == 0);
+    n = epoll_wait(ep, got, 8, 0);
+    CHECK(n == 1 && got[0].data.u32 == 2);
+    // a closed fd drops out by itself
+    close(e);
+    CHECK(epoll_wait(ep, got, 8, 0) == 0);
+    close(ep);
+    close(t);
+
+    // select
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(p[0], &rd);
+    struct timeval tv = { 1, 0 };
+    CHECK(select(p[0] + 1, &rd, NULL, NULL, &tv) == 1 && FD_ISSET(p[0], &rd));
+    char c;
+    read(p[0], &c, 1);
+    FD_ZERO(&rd);
+    FD_SET(p[0], &rd);
+    tv = (struct timeval){ 0, 30000 };
+    CHECK(select(p[0] + 1, &rd, NULL, NULL, &tv) == 0);
+    close(p[0]);
+    close(p[1]);
+
+    // signalfd takes blocked signals as data
+    sigset_t m;
+    sigemptyset(&m);
+    sigaddset(&m, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &m, NULL);
+    int sf = signalfd(-1, &m, SFD_CLOEXEC);
+    raise(SIGUSR2);
+    struct signalfd_siginfo si;
+    CHECK(sf >= 0 && read(sf, &si, sizeof si) == sizeof si && si.ssi_signo == SIGUSR2 &&
+          (pid_t)si.ssi_pid == getpid());
+    close(sf);
+    sigprocmask(SIG_UNBLOCK, &m, NULL);
+
+    // alarm and setitimer
+    signal(SIGALRM, on_alarm);
+    alarms = 0;
+    alarm(1);
+    CHECK(alarm(1) == 1);
+    alarm(0);
+    struct itimerval it = { { 0, 20000 }, { 0, 20000 } };
+    CHECK(setitimer(ITIMER_REAL, &it, NULL) == 0);
+    while (alarms < 3)
+        pause();
+    memset(&it, 0, sizeof it);
+    setitimer(ITIMER_REAL, &it, NULL);
+    CHECK(alarms >= 3);
+    signal(SIGALRM, SIG_DFL);
+
+    // memfd: shared between a mapping here and one in a child
+    int mf = memfd_create("ltest", MFD_CLOEXEC);
+    CHECK(mf >= 0 && ftruncate(mf, 8192) == 0);
+    struct stat st;
+    CHECK(fstat(mf, &st) == 0 && st.st_size == 8192);
+    char *sh = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, mf, 0);
+    CHECK(sh != MAP_FAILED);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *c2 = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, mf, 0);
+        strcpy(c2 + 4096, "from the child");
+        sh[0] = 'Z';
+        _exit(0);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    CHECK(strcmp(sh + 4096, "from the child") == 0 && sh[0] == 'Z');
+    char rb[16] = { 0 };
+    CHECK(pread(mf, rb, 14, 4096) == 14 && strcmp(rb, "from the child") == 0);
+    munmap(sh, 8192);
+    close(mf);
+
+    // shared anonymous memory survives fork as shared
+    int *cnt = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *cnt = 0;
+    pid = fork();
+    if (pid == 0) {
+        *cnt = 41;
+        _exit(0);
+    }
+    waitpid(pid, &status, 0);
+    CHECK(*cnt == 41);
+    // private anonymous memory doesn't
+    int *priv = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    *priv = 1;
+    pid = fork();
+    if (pid == 0) {
+        *priv = 2;
+        _exit(0);
+    }
+    waitpid(pid, &status, 0);
+    CHECK(*priv == 1);
+    munmap(cnt, 4096);
+    munmap(priv, 4096);
+}
+
 static void test_signals(void)
 {
     // a handler runs, with siginfo, and the fpu state survives it
@@ -614,6 +766,7 @@ int main(int argc, char **argv)
     test_signals();
     test_threads();
     test_unix();
+    test_events();
 
     printf("ltest: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

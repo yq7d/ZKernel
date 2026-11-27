@@ -381,7 +381,7 @@ bool vmm_protect_user(struct address_space *as, uint64_t virt, uint64_t flags)
         // shared copy on write pages stay read only until a write copies
         // them, the cow bit decides whether that write is allowed at all
         if (flags & PTE_WRITE) {
-            if (pmm_refcount(e & PTE_ADDR_MASK) > 1 && !(e & PTE_NOFREE))
+            if (pmm_refcount(e & PTE_ADDR_MASK) > 1 && !(e & (PTE_NOFREE | PTE_SHARED)))
                 e |= PTE_COW;
             else
                 e = (e & ~PTE_COW) | PTE_WRITE;
@@ -463,6 +463,11 @@ static bool clone_table(uint64_t *src, uint64_t *dst, int level)
         if (level == 1) {
             if (e & PTE_NOFREE) {
                 dst[i] = e;    // device memory stays shared and writable
+                continue;
+            }
+            if (e & PTE_SHARED) {
+                pmm_ref(e & PTE_ADDR_MASK);
+                dst[i] = e;
                 continue;
             }
             if (e & (PTE_WRITE | PTE_COW)) {

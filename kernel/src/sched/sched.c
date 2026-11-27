@@ -3,6 +3,7 @@
 #include "arch/x86_64/fpu.h"
 #include "arch/x86_64/gdt.h"
 #include "drivers/pit.h"
+#include "sched/ktimer.h"
 #include "lib/string.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
@@ -405,6 +406,7 @@ void sched_tick(void)
         return;
 
     current->cpu_ticks++;
+    ktimer_tick(timer_uptime_ms());
 
     uint64_t now = timer_ticks();
     struct thread **p = &sleepers;

@@ -801,6 +801,7 @@ void proc_exit_signal(int sig, bool core)
 // the last thread is gone, take the process down with this one
 __attribute__((noreturn)) static void finish(struct proc *p, int code)
 {
+    ktimer_cancel(&p->alarm);
     close_fds(p);    // can block, so before interrupts go off
 
     cli();

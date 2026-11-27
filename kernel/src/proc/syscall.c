@@ -433,15 +433,10 @@ static int64_t sys_ioctl(int fd, unsigned long req, uint64_t arg)
     return f ? file_ioctl(f, req, arg) : ZK_EBADF;
 }
 
-#define MAX_POLL 64
+#define MAX_POLL 1024
 
-int64_t sys_poll(uint64_t ufds, size_t n, int64_t timeout)
+int64_t poll_fds(struct zk_pollfd *fds, size_t n, int64_t timeout)
 {
-    if (n > MAX_POLL)
-        return ZK_EINVAL;
-    struct zk_pollfd fds[MAX_POLL];
-    if (n && copy_in(fds, ufds, n * sizeof(fds[0])))
-        return ZK_EFAULT;
     struct proc *me = proc_current();
     uint64_t deadline = timeout > 0 ? timer_uptime_ms() + (uint64_t)timeout : 0;
 
@@ -476,8 +471,25 @@ int64_t sys_poll(uint64_t ufds, size_t n, int64_t timeout)
         poll_wait(left);
     }
     irq_restore(flags);
-    if (n && copy_out(ufds, fds, n * sizeof(fds[0])))
-        return ZK_EFAULT;
+    return ready;
+}
+
+int64_t sys_poll(uint64_t ufds, size_t n, int64_t timeout)
+{
+    if (n > MAX_POLL)
+        return ZK_EINVAL;
+    struct zk_pollfd small[16];
+    struct zk_pollfd *fds = n <= 16 ? small : kmalloc(n * sizeof(*fds));
+    if (!fds)
+        return ZK_ENOMEM;
+    int64_t ready = ZK_EFAULT;
+    if (!n || !copy_in(fds, ufds, n * sizeof(fds[0]))) {
+        ready = poll_fds(fds, n, timeout);
+        if (n && copy_out(ufds, fds, n * sizeof(fds[0])))
+            ready = ZK_EFAULT;
+    }
+    if (fds != small)
+        kfree(fds);
     return ready;
 }
 

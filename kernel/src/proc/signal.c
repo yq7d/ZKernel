@@ -9,6 +9,7 @@
 #include "lib/string.h"
 #include "mm/mm.h"
 #include "sched/sched.h"
+#include "fs/vfs.h"
 
 #define USER_CS 0x23
 #define USER_SS 0x1B
@@ -119,17 +120,21 @@ void signal_send(struct proc *p, int sig, const struct ksiginfo *info)
         // linux drops ignored signals right away, even blocked ones
         p->sig_pending |= SIGBIT(sig);
         save_info(p, sig, info);
-        // wake one thread that will take it
-        for (struct thread *t = p->threads; t; t = t->tg_next) {
-            if (t->sig_blocked & SIGBIT(sig))
-                continue;
-            if (t == p->thread && p->main_gone)
-                continue;
-            interrupt(t);
-            break;
+        // wake one thread that will take it, the main one first like linux
+        struct thread *m = p->thread;
+        if (m && !p->main_gone && !(m->sig_blocked & SIGBIT(sig))) {
+            interrupt(m);
+        } else {
+            for (struct thread *t = p->threads; t; t = t->tg_next) {
+                if (t == m || (t->sig_blocked & SIGBIT(sig)))
+                    continue;
+                interrupt(t);
+                break;
+            }
         }
     }
     irq_restore(flags);
+    poll_notify();    // signalfd readers
 }
 
 void signal_send_thread(struct thread *t, int sig, const struct ksiginfo *info)
@@ -149,6 +154,7 @@ void signal_send_thread(struct thread *t, int sig, const struct ksiginfo *info)
             interrupt(t);
     }
     irq_restore(flags);
+    poll_notify();
 }
 
 void signal_force(struct thread *t, int sig, const struct ksiginfo *info)

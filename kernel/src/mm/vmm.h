@@ -14,6 +14,7 @@ struct limine_memmap_response;
 #define PTE_GLOBAL  (1UL << 8)
 #define PTE_COW     (1UL << 9)    // available bit: read only until written, then copied
 #define PTE_NOFREE  (1UL << 10)   // available bit: device memory, not ours to free
+#define PTE_SHARED  (1UL << 11)   // available bit: MAP_SHARED, fork shares it writable
 #define PTE_NX      (1UL << 63)
 
 void vmm_init(struct limine_memmap_response *memmap,

@@ -7,6 +7,7 @@
 #include <zk/syscall.h>
 #include "sched/sched.h"
 #include "proc/signal.h"
+#include "sched/ktimer.h"
 
 #define PROC_MAX_FDS  256
 #define PROC_MAX_ARGS 64
@@ -48,6 +49,9 @@ struct proc {
     int group_code;
     bool kill_others;          // exec, every thread but the main one goes
     bool main_gone;            // the main thread called exit, the rest run on
+
+    struct ktimer alarm;       // ITIMER_REAL, SIGALRM when it fires
+    uint64_t alarm_interval;   // ms, 0 for one shot
 };
 
 #define ABI_ZOS   0

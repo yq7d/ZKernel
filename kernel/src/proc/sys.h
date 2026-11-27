@@ -28,6 +28,9 @@ int get_path(uint64_t addr, char *out);
 int get_exec_args(uint64_t upath, uint64_t uargv, uint64_t uenvp, struct exec_args **out);
 
 int64_t sys_poll(uint64_t ufds, size_t n, int64_t timeout);
+struct zk_pollfd;
+// the poll loop on a kernel copy of the fds
+int64_t poll_fds(struct zk_pollfd *fds, size_t n, int64_t timeout);
 int64_t sys_kill(uint64_t pid);
 int64_t sys_setuid(uint32_t uid);
 int64_t sys_setgid(uint32_t gid);

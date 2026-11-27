@@ -4,6 +4,8 @@
 #include "proc/linux.h"
 #include "proc/proc.h"
 #include "proc/futex.h"
+#include "proc/lfd.h"
+#include "fs/shmem.h"
 #include "proc/sys.h"
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/interrupts.h"
@@ -506,6 +508,10 @@ static int64_t l_fcntl(int fd, int cmd, uint64_t arg)
         f->flags = (f->flags & ~(O_APPEND | O_NONBLOCK)) | ((int)arg & (O_APPEND | O_NONBLOCK));
         sock_set_nonblock(f->v, arg & O_NONBLOCK);
         return 0;
+    case 1033:      // F_ADD_SEALS, nothing is enforced
+        return 0;
+    case 1034:      // F_GET_SEALS
+        return 0;
     default:        // locks and the rest: nothing else runs at the same time anyway
         return 0;
     }
@@ -537,6 +543,26 @@ static void unmap_range(struct address_space *as, uint64_t start, uint64_t len)
         vmm_free_user(as, v);
 }
 
+// maps the pages of a memory file, shared: writes show up in every mapping
+static int64_t map_shmem(struct address_space *as, uint64_t start, uint64_t len,
+                         uint64_t pf, struct vnode *v, uint64_t off)
+{
+    for (uint64_t va = start; va < start + len; va += PAGE_SIZE) {
+        uint64_t p = shmem_page(v, (off + (va - start)) / PAGE_SIZE);
+        if (!p) {
+            unmap_range(as, start, va - start);
+            return ZK_ENOMEM;
+        }
+        pmm_ref(p);
+        if (!vmm_map_user(as, va, p, pf | PTE_SHARED)) {
+            pmm_free(p);
+            unmap_range(as, start, va - start);
+            return ZK_ENOMEM;
+        }
+    }
+    return 0;
+}
+
 static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, uint64_t off)
 {
     struct address_space *as = thread_current()->as;
@@ -545,6 +571,7 @@ static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, 
     len = ALIGN_UP(len, PAGE_SIZE);
     if (len > (64UL << 30))
         return ZK_ENOMEM;
+    bool shared = (flags & 3) == MAP_SHARED || (flags & 3) == 3;    // MAP_SHARED_VALIDATE
 
     struct file *f = NULL;
     if (!(flags & MAP_ANONYMOUS)) {
@@ -567,12 +594,23 @@ static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, 
         start = as->mmap_next - len;
         as->mmap_next = start;
     }
+    uint64_t pf = prot_flags(prot);
+
+    // shared memory: a memory file's own pages, or a fresh one for anonymous
+    if (shared && (!f || shmem_is(f->v))) {
+        struct vnode *v = f ? f->v : shmem_new(len);
+        if (!v)
+            return ZK_ENOMEM;
+        int64_t err = map_shmem(as, start, len, pf, v, f ? off : 0);
+        if (!f)
+            vnode_put(v);    // the mappings hold the pages now
+        return err ? err : (int64_t)start;
+    }
 
     // reservations get no pages, mprotect fills them in later
     if (prot == 0 && !f)
         return (int64_t)start;
 
-    uint64_t pf = prot_flags(prot);
     for (uint64_t v = start; v < start + len; v += PAGE_SIZE) {
         uint64_t p = pmm_alloc_zeroed();
         if (!p || !vmm_map_user(as, v, p, pf)) {
@@ -582,7 +620,8 @@ static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, 
             return ZK_ENOMEM;
         }
         if (f) {
-            // a private copy of the file, there's no page cache to share
+            // a private copy of the file. shared mappings of ordinary files
+            // get one too, there's no page cache to share
             uint64_t pos = off + (v - start);
             if (pos < f->v->size) {
                 size_t n = f->v->size - pos < PAGE_SIZE ? f->v->size - pos : PAGE_SIZE;
@@ -594,8 +633,36 @@ static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, 
             }
         }
     }
-    (void)MAP_SHARED;
     return (int64_t)start;
+}
+
+#define MFD_CLOEXEC 1
+
+static int64_t l_memfd_create(uint64_t uname, unsigned flags)
+{
+    char name[250];
+    int err = get_string(uname, name, sizeof name);
+    if (err)
+        return err;
+    struct vnode *v = shmem_new(0);
+    if (!v)
+        return ZK_ENOMEM;
+    const struct zk_cred *c = cred_current();
+    v->uid = c->euid;
+    v->gid = c->egid;
+    v->mode = 0777;
+    struct file *f = file_new(v, O_RDWR);
+    vnode_put(v);
+    if (!f)
+        return ZK_ENOMEM;
+    int fd = proc_fd_alloc(me(), f);
+    if (fd < 0) {
+        file_put(f);
+        return fd;
+    }
+    if (flags & MFD_CLOEXEC)
+        proc_set_cloexec(me(), fd, true);
+    return fd;
 }
 
 static int64_t l_munmap(uint64_t addr, uint64_t len)
@@ -1336,8 +1403,9 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 33:  return l_dup3((int)A1, (int)A2, 0);
     case 34:  return wait_signal();    // pause
     case 35:  return l_nanosleep(A1);
-    case 37:  return 0;            // alarm
-    case 38:  return 0;            // setitimer
+    case 36:  return lfd_getitimer((int)A1, A2);
+    case 37:  return lfd_alarm((uint32_t)A1);
+    case 38:  return lfd_setitimer((int)A1, A2, A3);
     case 39:  return (int64_t)p->pid;
     case 41: case 42: case 43: case 44: case 45: case 46: case 47: case 48:
     case 49: case 50: case 51: case 52: case 53: case 54: case 55:
@@ -1464,8 +1532,28 @@ static int64_t dispatch(struct interrupt_frame *f)
             return ZK_EINVAL;
         return copy_out(A3, &mask, 8) ? ZK_EFAULT : 8;
     }
-    case 213: case 232: case 233: case 281: case 291:
-        return ZK_ENOSYS;          // epoll
+    case 213: return (int32_t)A1 <= 0 ? ZK_EINVAL : lfd_epoll_create(0);
+    case 291: return lfd_epoll_create((int)A1);
+    case 233: return lfd_epoll_ctl((int)A1, (int)A2, (int)A3, A4);
+    case 232: return lfd_epoll_wait((int)A1, A2, (int)A3, (int32_t)A4, 0);
+    case 281: return lfd_epoll_wait((int)A1, A2, (int)A3, (int32_t)A4, A5);
+    case 441: {    // epoll_pwait2, a timespec timeout
+        int64_t ms = -1;
+        if (A4) {
+            struct timespec ts;
+            if (copy_in(&ts, A4, sizeof ts))
+                return ZK_EFAULT;
+            ms = ts.sec * 1000 + (ts.nsec + 999999) / 1000000;
+        }
+        return lfd_epoll_wait((int)A1, A2, (int)A3, ms, A5);
+    }
+    case 282: return lfd_signalfd((int)A1, A2, A3, 0);
+    case 289: return lfd_signalfd((int)A1, A2, A3, (int)A4);
+    case 283: return lfd_timerfd_create((int)A1, (int)A2);
+    case 286: return lfd_timerfd_settime((int)A1, (int)A2, A3, A4);
+    case 287: return lfd_timerfd_gettime((int)A1, A2);
+    case 284: return lfd_eventfd((uint32_t)A1, 0);
+    case 290: return lfd_eventfd((uint32_t)A1, (int)A2);
     case 217: return l_getdents64((int)A1, A2, A3);
     case 218:    // set_tid_address
         thread_current()->clear_tid = A1;
@@ -1489,7 +1577,26 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 268: return l_chmodat((int)A1, A2, (uint32_t)A3);
     case 269:
     case 439: return l_access((int)A1, A2, (int)A3);
-    case 270: return ZK_ENOSYS;    // pselect6
+    case 23: {    // select, a timeval
+        int64_t ms = -1;
+        if (A5) {
+            int64_t tv[2];
+            if (copy_in(tv, A5, sizeof tv))
+                return ZK_EFAULT;
+            ms = tv[0] * 1000 + (tv[1] + 999) / 1000;
+        }
+        return lfd_select((int)A1, A2, A3, A4, ms);
+    }
+    case 270: {    // pselect6, a timespec
+        int64_t ms = -1;
+        if (A5) {
+            struct timespec ts;
+            if (copy_in(&ts, A5, sizeof ts))
+                return ZK_EFAULT;
+            ms = ts.sec * 1000 + (ts.nsec + 999999) / 1000000;
+        }
+        return lfd_select((int)A1, A2, A3, A4, ms);
+    }
     case 271: return l_ppoll(A1, A2, A3);
     case 273: return 0;            // set_robust_list
     case 280: return 0;            // utimensat
@@ -1499,6 +1606,7 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 302: return l_prlimit((int)A2, A3, A4);
     case 316: return l_renameat((int)A1, A2, (int)A3, A4);
     case 318: return sys_getrandom(A1, A2);
+    case 319: return l_memfd_create(A1, (unsigned)A2);
     case 332: return ZK_ENOSYS;    // statx, everyone falls back to fstatat
     case 334: return ZK_ENOSYS;    // rseq
     case 435: return ZK_ENOSYS;    // clone3, glibc falls back to clone
