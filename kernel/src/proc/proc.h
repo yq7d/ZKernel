@@ -31,16 +31,23 @@ struct proc {
     uint32_t cloexec;          // fds closed by exec, one bit each
     char exe[ZK_PATH_MAX];
 
-    // signals, see signal.h. changed with interrupts off
-    uint64_t sig_pending, sig_blocked;
+    // signals, see signal.h. changed with interrupts off. the mask and
+    // the altstack are per thread
+    uint64_t sig_pending;      // sent to the process, any thread takes it
     struct ksigaction sigact[NSIG];
     struct ksiginfo siginfo[NSIG];
-    uint64_t altstack_sp, altstack_size;
-    int altstack_flags;
-    uint64_t sig_saved;        // mask to put back after rt_sigsuspend
-    bool sig_restore;
     int death_sig;             // what it died from, 0 if it exited
     bool core;
+
+    // threads. thread is the main one, its id is the pid. it outlives the
+    // others, then tears the process down
+    struct thread *threads;    // all of them, through tg_next
+    int nthreads;
+    struct waitq thread_wq;    // the main thread waits here for the rest
+    bool group_exit;           // exit_group or a fatal signal, all threads go
+    int group_code;
+    bool kill_others;          // exec, every thread but the main one goes
+    bool main_gone;            // the main thread called exit, the rest run on
 };
 
 #define ABI_ZOS   0
@@ -85,7 +92,27 @@ int proc_kill_group(uint64_t pgid);
 int proc_signal(int64_t pid, int sig, int code);
 // no permission check, for the tty and the kernel. returns how many it hit
 int proc_signal_group(uint64_t pgid, int sig);
+// exit_group: ends every thread of the process
 __attribute__((noreturn)) void proc_exit(int code);
+// exit: ends the calling thread, the process goes with its last thread
+__attribute__((noreturn)) void proc_thread_exit(int code);
+// the caller's process should be torn down, or at least this thread
+bool proc_thread_doomed(void);
+#define CLONE_VM             0x100
+#define CLONE_FS             0x200
+#define CLONE_FILES          0x400
+#define CLONE_SIGHAND        0x800
+#define CLONE_VFORK          0x4000
+#define CLONE_THREAD         0x10000
+#define CLONE_SETTLS         0x80000
+#define CLONE_PARENT_SETTID  0x100000
+#define CLONE_CHILD_CLEARTID 0x200000
+#define CLONE_CHILD_SETTID   0x1000000
+// clone with CLONE_THREAD. returns the new tid
+int64_t proc_clone_thread(struct interrupt_frame *frame, uint64_t flags, uint64_t sp,
+                          uint64_t ptid, uint64_t ctid, uint64_t tls);
+// a thread by id, and its process. interrupts off
+struct thread *proc_find_thread(uint64_t tid);
 // the exit code is 128 + sig, like a shell shows it
 __attribute__((noreturn)) void proc_exit_signal(int sig, bool core);
 // status is the exit code, with the signal it died from in bits 16-23

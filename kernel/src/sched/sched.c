@@ -127,9 +127,9 @@ static void schedule(void)
 
 static void free_thread(struct thread *t)
 {
-    if (t->proc)
+    if (t->proc && !t->extra)
         proc_free(t->proc);
-    if (t->as)
+    if (t->as && !t->extra)
         vmm_destroy_space(t->as);
     vmm_free_stack(t->stack_top, t->stack_pages);
     kfree(t->fpu);

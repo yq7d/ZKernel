@@ -88,15 +88,18 @@ struct ksiginfo {
 };
 
 struct proc;
+struct thread;
 struct interrupt_frame;
 
-// queue sig for p. interrupts off or on
+// queue sig for the process, whichever thread doesn't block it takes it
 void signal_send(struct proc *p, int sig, const struct ksiginfo *info);
+// queue sig for one thread (tgkill, faults)
+void signal_send_thread(struct thread *t, int sig, const struct ksiginfo *info);
 // for faults: unblocks sig and resets SIG_IGN, like linux's force_sig
-void signal_force(struct proc *p, int sig, const struct ksiginfo *info);
-// a signal is waiting that will do something, so blocking calls should
-// return EINTR
-bool signal_pending(struct proc *p);
+void signal_force(struct thread *t, int sig, const struct ksiginfo *info);
+// a signal is waiting for t that will do something, or the process is
+// going away, so blocking calls should return EINTR
+bool signal_pending(struct thread *t);
 // last thing before going back to user mode. syscall is the linux syscall
 // number when coming back from one (for SA_RESTART), else -1
 void signal_return(struct interrupt_frame *f, int64_t syscall);
@@ -104,6 +107,8 @@ void signal_return(struct interrupt_frame *f, int64_t syscall);
 void signal_sigreturn(struct interrupt_frame *f);
 // what the default action of sig does
 bool signal_default_ignores(int sig);
-// fork copies handlers and mask, exec drops handlers
-void signal_fork(struct proc *child, const struct proc *parent);
-void signal_exec(struct proc *p);
+// fork copies handlers, and the forking thread's mask and altstack
+void signal_fork(struct proc *child, struct thread *ct, const struct proc *parent,
+                 const struct thread *pt);
+// exec drops handlers and the altstack
+void signal_exec(struct proc *p, struct thread *t);

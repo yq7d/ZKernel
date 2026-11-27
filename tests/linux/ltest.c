@@ -2,6 +2,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <sys/syscall.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -44,6 +47,196 @@ static void handle(int sig, void (*fn)(int, siginfo_t *, void *), int flags)
     sa.sa_sigaction = fn;
     sa.sa_flags = SA_SIGINFO | flags;
     sigaction(sig, &sa, NULL);
+}
+
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+static long counter;
+static int ready_flag;
+static __thread int tls_var = 5;
+static sem_t sem;
+static pthread_barrier_t barrier;
+static volatile pid_t worker_tid;
+static volatile int worker_got;
+
+static void *count_up(void *arg)
+{
+    for (int i = 0; i < 20000; i++) {
+        pthread_mutex_lock(&lock);
+        counter++;
+        pthread_mutex_unlock(&lock);
+        if (i % 1000 == 0)
+            sched_yield();
+    }
+    // every thread has its own copy
+    tls_var += (int)(long)arg;
+    return (void *)(long)tls_var;
+}
+
+static void *wait_ready(void *arg)
+{
+    (void)arg;
+    pthread_mutex_lock(&lock);
+    while (!ready_flag)
+        pthread_cond_wait(&cond, &lock);
+    pthread_mutex_unlock(&lock);
+    sem_post(&sem);
+    return NULL;
+}
+
+static void *at_barrier(void *arg)
+{
+    (void)arg;
+    pthread_barrier_wait(&barrier);
+    return NULL;
+}
+
+static void on_worker_sig(int sig) { (void)sig; worker_got = (int)syscall(SYS_gettid); }
+
+static void *sig_worker(void *arg)
+{
+    (void)arg;
+    worker_tid = (pid_t)syscall(SYS_gettid);
+    while (!worker_got)
+        usleep(1000);
+    return NULL;
+}
+
+static void *exits_all(void *arg)
+{
+    (void)arg;
+    usleep(20000);
+    exit(7);
+}
+
+static void *blocks_forever(void *arg)
+{
+    (void)arg;
+    for (;;)
+        pause();
+}
+
+static void test_threads(void)
+{
+    // a mutex keeps the count right, tls is per thread, join gets the result
+    pthread_t t[4];
+    counter = 0;
+    for (long i = 0; i < 4; i++)
+        CHECK(pthread_create(&t[i], NULL, count_up, (void *)(i + 1)) == 0);
+    int sum = 0;
+    for (int i = 0; i < 4; i++) {
+        void *r;
+        CHECK(pthread_join(t[i], &r) == 0);
+        sum += (int)(long)r;
+    }
+    CHECK(counter == 80000);
+    CHECK(sum == 5 * 4 + 1 + 2 + 3 + 4);
+    CHECK(tls_var == 5);
+
+    // condition variables and semaphores
+    sem_init(&sem, 0, 0);
+    ready_flag = 0;
+    for (int i = 0; i < 3; i++)
+        pthread_create(&t[i], NULL, wait_ready, NULL);
+    usleep(20000);
+    pthread_mutex_lock(&lock);
+    ready_flag = 1;
+    pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&lock);
+    for (int i = 0; i < 3; i++)
+        sem_wait(&sem);
+    for (int i = 0; i < 3; i++)
+        CHECK(pthread_join(t[i], NULL) == 0);
+
+    // a timed wait times out
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 50 * 1000000;
+    if (ts.tv_nsec >= 1000000000) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000;
+    }
+    pthread_mutex_lock(&lock);
+    CHECK(pthread_cond_timedwait(&cond, &lock, &ts) == ETIMEDOUT);
+    pthread_mutex_unlock(&lock);
+
+    // barriers
+    pthread_barrier_init(&barrier, NULL, 4);
+    for (int i = 0; i < 3; i++)
+        pthread_create(&t[i], NULL, at_barrier, NULL);
+    pthread_barrier_wait(&barrier);
+    for (int i = 0; i < 3; i++)
+        CHECK(pthread_join(t[i], NULL) == 0);
+    pthread_barrier_destroy(&barrier);
+
+    // threads have their own ids, the process keeps one pid
+    CHECK(syscall(SYS_gettid) == getpid());
+
+    // pthread_kill reaches that one thread
+    signal(SIGUSR1, on_worker_sig);
+    worker_got = 0;
+    worker_tid = 0;
+    pthread_create(&t[0], NULL, sig_worker, NULL);
+    while (!worker_tid)
+        usleep(1000);
+    CHECK(pthread_kill(t[0], SIGUSR1) == 0);
+    CHECK(pthread_join(t[0], NULL) == 0);
+    CHECK(worker_got == worker_tid && worker_tid != getpid());
+    signal(SIGUSR1, SIG_DFL);
+
+    // exit from any thread ends the whole process, even with threads stuck
+    int status;
+    pid_t pid = fork();
+    if (pid == 0) {
+        pthread_t a, b;
+        pthread_create(&b, NULL, blocks_forever, NULL);
+        pthread_create(&a, NULL, exits_all, NULL);
+        for (;;)
+            pause();
+    }
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 7);
+
+    // a fatal signal takes every thread down
+    pid = fork();
+    if (pid == 0) {
+        pthread_t a;
+        pthread_create(&a, NULL, blocks_forever, NULL);
+        for (;;)
+            pause();
+    }
+    usleep(30000);
+    kill(pid, SIGTERM);
+    CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
+
+    // the main thread leaving with pthread_exit lets the rest finish
+    pid = fork();
+    if (pid == 0) {
+        pthread_t a;
+        pthread_create(&a, NULL, exits_all, NULL);
+        pthread_exit(NULL);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 7);
+
+    // fork from a threaded process gives a child with one thread
+    pthread_create(&t[0], NULL, wait_ready, NULL);
+    pid = fork();
+    if (pid == 0)
+        _exit(3);
+    CHECK(waitpid(pid, &status, 0) == pid && WEXITSTATUS(status) == 3);
+    sem_wait(&sem);
+    pthread_join(t[0], NULL);
+
+    // exec from a threaded process
+    pthread_create(&t[0], NULL, blocks_forever, NULL);
+    pid = fork();
+    if (pid == 0) {
+        pthread_t a;
+        pthread_create(&a, NULL, blocks_forever, NULL);
+        char *args[] = { "true", NULL };
+        execv("/bin/true", args);
+        _exit(99);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 static void test_signals(void)
@@ -238,6 +431,7 @@ int main(int argc, char **argv)
     CHECK(argc >= 1 && argv[0] != NULL);
 
     test_signals();
+    test_threads();
 
     printf("ltest: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

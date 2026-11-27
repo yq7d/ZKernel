@@ -3,6 +3,7 @@
 // threaded: clone with CLONE_VM is only accepted the way vfork uses it
 #include "proc/linux.h"
 #include "proc/proc.h"
+#include "proc/futex.h"
 #include "proc/sys.h"
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/interrupts.h"
@@ -668,22 +669,104 @@ static int64_t l_wait4(int64_t pid, uint64_t ustatus, int options, uint64_t urus
     return r;
 }
 
-#define CLONE_VM      0x100
-#define CLONE_VFORK   0x4000
-#define CLONE_THREAD  0x10000
-#define CLONE_CHILD_SETTID 0x1000000
-
 static int64_t l_clone(struct interrupt_frame *f, uint64_t flags, uint64_t stack,
-                       uint64_t ptid, uint64_t ctid)
+                       uint64_t ptid, uint64_t ctid, uint64_t tls)
 {
-    (void)ptid;
-    if (flags & CLONE_THREAD)
-        return ZK_ENOSYS;    // no threads
+    if (flags & CLONE_THREAD) {
+        // threads share everything, anything else isn't a thread here
+        uint64_t need = CLONE_VM | CLONE_SIGHAND | CLONE_FILES | CLONE_FS;
+        if ((flags & need) != need)
+            return ZK_EINVAL;
+        return proc_clone_thread(f, flags, stack, ptid, ctid, tls);
+    }
     if ((flags & CLONE_VM) && !(flags & CLONE_VFORK))
         return ZK_ENOSYS;
     // vfork style children get a copy instead of the shared memory, which
     // is fine since they only exec or exit
     return proc_fork(f, stack, (flags & CLONE_CHILD_SETTID) ? ctid : 0);
+}
+
+#define FUTEX_WAIT           0
+#define FUTEX_WAKE           1
+#define FUTEX_REQUEUE        3
+#define FUTEX_CMP_REQUEUE    4
+#define FUTEX_WAIT_BITSET    9
+#define FUTEX_WAKE_BITSET    10
+#define FUTEX_CLOCK_REALTIME 256
+
+static int64_t l_futex(uint64_t uaddr, int op, uint32_t val, uint64_t utime,
+                       uint64_t uaddr2, uint32_t val3)
+{
+    int cmd = op & 0x7f;
+    struct address_space *as = thread_current()->as;
+    switch (cmd) {
+    case FUTEX_WAIT:
+    case FUTEX_WAIT_BITSET: {
+        int64_t ms = -1;
+        if (utime) {
+            int64_t ts[2];
+            if (copy_in(ts, utime, sizeof ts))
+                return ZK_EFAULT;
+            if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000)
+                return ZK_EINVAL;
+            int64_t t = ts[0] * 1000 + (ts[1] + 999999) / 1000000;
+            if (cmd == FUTEX_WAIT_BITSET) {
+                // absolute, on the monotonic clock unless told otherwise
+                uint64_t up = timer_uptime_ms();
+                int64_t now = (op & FUTEX_CLOCK_REALTIME)
+                            ? rtc_now() * 1000 + (int64_t)(up % 1000) : (int64_t)up;
+                t -= now;
+                if (t < 0)
+                    t = 0;
+            }
+            ms = t;
+        }
+        int64_t r = futex_wait(uaddr, val, ms,
+                               cmd == FUTEX_WAIT ? FUTEX_BITSET_ANY : val3);
+        return r;
+    }
+    case FUTEX_WAKE:
+        return futex_wake(as, uaddr, (int)val, FUTEX_BITSET_ANY);
+    case FUTEX_WAKE_BITSET:
+        return val3 ? futex_wake(as, uaddr, (int)val, val3) : ZK_EINVAL;
+    case FUTEX_CMP_REQUEUE: {
+        uint32_t cur;
+        if (copy_in(&cur, uaddr, 4))
+            return ZK_EFAULT;
+        if (cur != val3)
+            return ZK_EAGAIN;
+    }
+    // fall through
+    case FUTEX_REQUEUE:
+        // the timeout slot carries how many to move
+        return futex_requeue(uaddr, (int)val, uaddr2, (int)(uint32_t)utime);
+    }
+    return ZK_ENOSYS;
+}
+
+static int64_t l_tkill(int64_t tgid, int64_t tid, int sig)
+{
+    if (tid <= 0 || sig < 0 || sig > NSIG)
+        return ZK_EINVAL;
+    uint64_t irq = irq_save();
+    struct thread *t = proc_find_thread((uint64_t)tid);
+    if (!t || !t->proc || (tgid > 0 && t->proc->pid != (uint64_t)tgid)) {
+        irq_restore(irq);
+        return ZK_ESRCH;
+    }
+    const struct zk_cred *c = cred_current();
+    const struct zk_cred *tc = &t->proc->cred;
+    if (c->euid != 0 && c->uid != tc->uid && c->euid != tc->uid &&
+        c->uid != tc->suid && c->euid != tc->suid) {
+        irq_restore(irq);
+        return ZK_EPERM;
+    }
+    if (sig) {
+        struct ksiginfo si = { .code = SI_TKILL, .pid = (int)me()->pid, .uid = c->uid };
+        signal_send_thread(t, sig, &si);
+    }
+    irq_restore(irq);
+    return 0;
 }
 
 static int64_t l_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
@@ -725,8 +808,11 @@ static int64_t l_sigaction(int sig, uint64_t uact, uint64_t uold, uint64_t size)
         uint64_t flags = irq_save();
         p->sigact[sig - 1] = act;
         // a pending signal that's now ignored goes away
-        if (act.handler == SIG_IGN || (act.handler == SIG_DFL && signal_default_ignores(sig)))
+        if (act.handler == SIG_IGN || (act.handler == SIG_DFL && signal_default_ignores(sig))) {
             p->sig_pending &= ~SIGBIT(sig);
+            for (struct thread *t = p->threads; t; t = t->tg_next)
+                t->sig_pending &= ~SIGBIT(sig);
+        }
         irq_restore(flags);
     }
     return 0;
@@ -736,7 +822,7 @@ static int64_t l_sigprocmask(int how, uint64_t uset, uint64_t uold, uint64_t siz
 {
     if (size != 8)
         return ZK_EINVAL;
-    struct proc *p = me();
+    struct thread *p = thread_current();
     uint64_t old = p->sig_blocked, set = 0;
     if (uset && copy_in(&set, uset, 8))
         return ZK_EFAULT;
@@ -774,7 +860,7 @@ static int64_t l_sigsuspend(uint64_t umask, uint64_t size)
         return ZK_EINVAL;
     if (copy_in(&mask, umask, 8))
         return ZK_EFAULT;
-    struct proc *p = me();
+    struct thread *p = thread_current();
     uint64_t flags = irq_save();
     p->sig_saved = p->sig_blocked;
     p->sig_restore = true;
@@ -787,8 +873,8 @@ static int64_t l_sigpending(uint64_t uset, uint64_t size)
 {
     if (size != 8)
         return ZK_EINVAL;
-    struct proc *p = me();
-    uint64_t set = p->sig_pending & p->sig_blocked;
+    struct thread *t = thread_current();
+    uint64_t set = (t->sig_pending | me()->sig_pending) & t->sig_blocked;
     return copy_out(uset, &set, 8) ? ZK_EFAULT : 0;
 }
 
@@ -800,7 +886,7 @@ struct l_stack_t {
 
 static int64_t l_sigaltstack(uint64_t uss, uint64_t uold, uint64_t rsp)
 {
-    struct proc *p = me();
+    struct thread *p = thread_current();
     bool on = p->altstack_size && rsp > p->altstack_sp &&
               rsp <= p->altstack_sp + p->altstack_size;
     if (uold) {
@@ -1248,11 +1334,11 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 41: case 42: case 43: case 44: case 45: case 46: case 47: case 48:
     case 49: case 50: case 51: case 52: case 53: case 54: case 55:
         return linux_socketcall(f->rax, A1, A2, A3, A4, A5, A6);
-    case 56:  return l_clone(f, A1, A2, A3, A4);
+    case 56:  return l_clone(f, A1, A2, A3, A4, A5);
     case 57:  return proc_fork(f, 0, 0);
     case 58:  return proc_fork(f, 0, 0);
     case 59:  return l_execve(A1, A2, A3);
-    case 60:  proc_exit((int)(A1 & 0xff));
+    case 60:  proc_thread_exit((int)(A1 & 0xff));
     case 61:  return l_wait4((int64_t)A1, A2, (int)A3, A4);
     case 62:  return l_kill((int64_t)(int32_t)A1, (int)A2, SI_USER);
     case 63:  return l_uname(A1);
@@ -1354,16 +1440,16 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 157: return 0;            // prctl
     case 158: return l_arch_prctl((int)A1, A2);
     case 162: vfs_sync(); return 0;
-    case 186: return (int64_t)p->pid;    // gettid
-    case 200: return (int32_t)A1 <= 0 ? ZK_EINVAL : l_kill((int32_t)A1, (int)A2, SI_TKILL);
-    case 234: return (int32_t)A2 <= 0 ? ZK_EINVAL : l_kill((int32_t)A2, (int)A3, SI_TKILL);
+    case 186: return (int64_t)thread_current()->id;    // gettid
+    case 200: return l_tkill(0, (int32_t)A1, (int)A2);
+    case 234: return l_tkill((int32_t)A1, (int32_t)A2, (int)A3);
     case 201: {
         int64_t t = rtc_now();
         if (A1 && copy_out(A1, &t, sizeof t))
             return ZK_EFAULT;
         return t;
     }
-    case 202: return (A2 & 0x7f) == 0 ? ZK_EAGAIN : 0;    // futex: nobody to wait for
+    case 202: return l_futex(A1, (int)A2, (uint32_t)A3, A4, A5, (uint32_t)A6);
     case 204: {    // sched_getaffinity
         uint64_t mask = 1;
         if (A2 < 8)
@@ -1373,7 +1459,9 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 213: case 232: case 233: case 281: case 291:
         return ZK_ENOSYS;          // epoll
     case 217: return l_getdents64((int)A1, A2, A3);
-    case 218: return (int64_t)p->pid;    // set_tid_address
+    case 218:    // set_tid_address
+        thread_current()->clear_tid = A1;
+        return (int64_t)thread_current()->id;
     case 228: return l_clock_gettime((int)A1, A2);
     case 229: {
         struct timespec res = { 0, 1000000 };

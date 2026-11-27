@@ -462,7 +462,7 @@ int64_t sys_poll(uint64_t ufds, size_t n, int64_t timeout)
         }
         if (ready || timeout == 0)
             break;
-        if (signal_pending(me)) {
+        if (proc_killed()) {
             ready = ZK_EINTR;
             break;
         }

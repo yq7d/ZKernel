@@ -9,6 +9,8 @@
 #include "lib/random.h"
 #include "lib/string.h"
 #include "proc/linux.h"
+#include "proc/futex.h"
+#include "proc/sys.h"
 #include "mm/heap.h"
 #include "mm/mm.h"
 #include "mm/pmm.h"
@@ -410,6 +412,8 @@ static struct thread *start_proc(struct proc *p, const char *name, thread_fn fn,
     struct thread *t = thread_create_with(name, fn, arg, joinable, as, p);
     if (t) {
         p->thread = t;
+        p->threads = t;
+        p->nthreads = 1;
         p->pid = t->id;
         p->pgid = pgid ? pgid : p->pid;
         p->list_next = procs;
@@ -443,7 +447,6 @@ struct thread *proc_spawn(const char *path, char **argv, char **envp,
         goto fail;
     apply_setid(&p->cred, &st);
     p->abi = abi;
-    p->altstack_flags = SS_DISABLE;
     strlcpy(p->exe, path, sizeof p->exe);
     // the terminal on stdin becomes the controlling one, else the parent's
     if (o->std[0] && tty_of(o->std[0]->v))
@@ -464,8 +467,12 @@ struct thread *proc_spawn(const char *path, char **argv, char **envp,
     }
 
     bool joinable = o->parent || !o->detached;
+    uint64_t irq = irq_save();
     struct thread *t = start_proc(p, base_name(path), user_thread, s, joinable, as,
                                   o->pgid, false);
+    if (t)
+        t->altstack_flags = SS_DISABLE;
+    irq_restore(irq);
     if (t)
         return t;
     close_fds(p);
@@ -513,7 +520,6 @@ int64_t proc_fork(struct interrupt_frame *frame, uint64_t new_rsp, uint64_t chil
     p->cred = me->cred;
     p->abi = me->abi;
     p->cloexec = me->cloexec;
-    signal_fork(p, me);
     p->ctty = me->ctty;
     if (p->ctty)
         vnode_get(p->ctty);
@@ -527,6 +533,8 @@ int64_t proc_fork(struct interrupt_frame *frame, uint64_t new_rsp, uint64_t chil
     // the child's tid goes into its memory before it can run
     uint64_t flags = irq_save();
     struct thread *t = start_proc(p, cur->name, fork_child, f, true, as, me->pgid, true);
+    if (t)
+        signal_fork(p, t, me, cur);
     if (t && child_tid && vmm_user_range_ok(as, child_tid, 4, true)) {
         uint64_t phys;
         uint32_t tid = (uint32_t)t->id;
@@ -553,9 +561,24 @@ int proc_exec(const char *path, char **argv, char **envp, void *release)
     struct zk_stat st;
     struct proc *me = proc_current();
     int abi;
+    // the new image starts with one thread. exec from a thread other than
+    // the main one would need the pid to move over, which isn't done
+    if (t->extra)
+        return ZK_EBUSY;
     int err = build_image(path, argv, envp, &me->cred, &as, &s, &st, &abi);
     if (err)
         return err;
+    if (me->nthreads > 1) {
+        uint64_t irq = irq_save();
+        me->kill_others = true;
+        for (struct thread *o = me->threads; o; o = o->tg_next)
+            if (o != t)
+                thread_interrupt(o);
+        while (me->nthreads > 1)
+            waitq_sleep(&me->thread_wq);
+        me->kill_others = false;
+        irq_restore(irq);
+    }
     apply_setid(&me->cred, &st);
     me->abi = abi;
     strlcpy(me->exe, path, sizeof me->exe);
@@ -567,7 +590,8 @@ int proc_exec(const char *path, char **argv, char **envp, void *release)
         }
     }
     me->cloexec = 0;
-    signal_exec(me);
+    signal_exec(me, t);
+    t->clear_tid = 0;
     t->fs_base = 0;
     wrmsr(MSR_FS_BASE, 0);
 
@@ -623,8 +647,69 @@ bool cred_in_group(const struct zk_cred *c, uint32_t gid)
 
 bool proc_killed(void)
 {
-    struct proc *p = proc_current();
-    return p && signal_pending(p);
+    return signal_pending(thread_current());
+}
+
+bool proc_thread_doomed(void)
+{
+    struct thread *t = thread_current();
+    struct proc *p = t->proc;
+    return p && (p->killed || p->group_exit || (p->kill_others && t != p->thread));
+}
+
+struct thread *proc_find_thread(uint64_t tid)
+{
+    for (struct proc *p = procs; p; p = p->list_next)
+        for (struct thread *t = p->threads; t; t = t->tg_next)
+            if (t->id == tid && t->state != THREAD_DEAD)
+                return t;
+    return NULL;
+}
+
+int64_t proc_clone_thread(struct interrupt_frame *frame, uint64_t flags, uint64_t sp,
+                          uint64_t ptid, uint64_t ctid, uint64_t tls)
+{
+    struct proc *me = proc_current();
+    struct thread *cur = thread_current();
+    struct interrupt_frame *f = kmalloc(sizeof(*f));
+    if (!f)
+        return ZK_ENOMEM;
+    *f = *frame;
+    f->rax = 0;
+    if (sp)
+        f->rsp = sp;
+
+    // nothing runs until it's all set up
+    uint64_t irq = irq_save();
+    if (me->group_exit || me->kill_others) {
+        irq_restore(irq);
+        kfree(f);
+        return ZK_EAGAIN;
+    }
+    struct thread *t = thread_create_with(cur->name, fork_child, f, false, cur->as, me);
+    if (!t) {
+        irq_restore(irq);
+        kfree(f);
+        return ZK_ENOMEM;
+    }
+    t->extra = true;
+    fpu_save(t->fpu);    // the caller's user state
+    t->fs_base = (flags & CLONE_SETTLS) ? tls : cur->fs_base;
+    t->sig_blocked = cur->sig_blocked;
+    t->altstack_flags = SS_DISABLE;
+    if (flags & CLONE_CHILD_CLEARTID)
+        t->clear_tid = ctid;
+    t->tg_next = me->threads;
+    me->threads = t;
+    me->nthreads++;
+    // the ids land before either thread can look at them
+    uint32_t tid = (uint32_t)t->id;
+    if (flags & CLONE_PARENT_SETTID)
+        copy_out(ptid, &tid, 4);
+    if (flags & CLONE_CHILD_SETTID)
+        copy_out(ctid, &tid, 4);
+    irq_restore(irq);
+    return tid;
 }
 
 static bool alive(struct proc *p)
@@ -706,14 +791,16 @@ int proc_signal(int64_t pid, int sig, int code)
 void proc_exit_signal(int sig, bool core)
 {
     struct proc *p = proc_current();
-    p->death_sig = sig;
-    p->core = core;
+    if (!p->group_exit) {
+        p->death_sig = sig;
+        p->core = core;
+    }
     proc_exit(128 + sig);
 }
 
-void proc_exit(int code)
+// the last thread is gone, take the process down with this one
+__attribute__((noreturn)) static void finish(struct proc *p, int code)
 {
-    struct proc *p = proc_current();
     close_fds(p);    // can block, so before interrupts go off
 
     cli();
@@ -733,6 +820,56 @@ void proc_exit(int code)
         waitq_wake_all(&p->parent->child_wq);
     }
     thread_exit(code);
+}
+
+void proc_thread_exit(int code)
+{
+    struct thread *t = thread_current();
+    struct proc *p = t->proc;
+
+    if (t->extra) {
+        // pthread_join waits on this
+        if (t->clear_tid) {
+            uint32_t zero = 0;
+            if (copy_out(t->clear_tid, &zero, 4) == 0)
+                futex_wake(t->as, t->clear_tid, 1, FUTEX_BITSET_ANY);
+        }
+        cli();
+        for (struct thread **pp = &p->threads; *pp; pp = &(*pp)->tg_next) {
+            if (*pp == t) {
+                *pp = t->tg_next;
+                break;
+            }
+        }
+        p->nthreads--;
+        waitq_wake_all(&p->thread_wq);
+        thread_exit(0);
+    }
+
+    // the main thread holds the process up until the others are gone
+    cli();
+    if (p->nthreads > 1)
+        p->main_gone = true;
+    while (p->nthreads > 1)
+        waitq_sleep(&p->thread_wq);
+    sti();
+    finish(p, p->group_exit ? p->group_code : code);
+}
+
+void proc_exit(int code)
+{
+    struct thread *t = thread_current();
+    struct proc *p = t->proc;
+    uint64_t irq = irq_save();
+    if (!p->group_exit) {
+        p->group_exit = true;
+        p->group_code = code;
+    }
+    for (struct thread *o = p->threads; o; o = o->tg_next)
+        if (o != t)
+            thread_interrupt(o);
+    irq_restore(irq);
+    proc_thread_exit(code);
 }
 
 int64_t proc_wait(int64_t pid, int *status, int flags)
@@ -769,7 +906,7 @@ int64_t proc_wait(int64_t pid, int *status, int flags)
             irq_restore(flags_irq);
             return 0;
         }
-        if (signal_pending(me)) {
+        if (proc_killed()) {
             irq_restore(flags_irq);
             return ZK_EINTR;
         }

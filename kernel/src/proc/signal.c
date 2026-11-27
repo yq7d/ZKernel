@@ -87,22 +87,24 @@ static bool ignored(struct proc *p, int sig)
     return h == SIG_IGN || (h == SIG_DFL && signal_default_ignores(sig));
 }
 
-static void queue(struct proc *p, int sig, const struct ksiginfo *info)
+static void interrupt(struct thread *t)
 {
-    if (sig == SIGKILL) {
-        p->killed = true;
-    } else {
-        p->sig_pending |= SIGBIT(sig);
-        if (info)
-            p->siginfo[sig - 1] = *info;
-        else
-            memset(&p->siginfo[sig - 1], 0, sizeof p->siginfo[0]);
-        if (p->sig_blocked & SIGBIT(sig))
-            return;
-    }
-    // waking it makes the blocking call return EINTR
-    if (p->thread && p->thread != thread_current())
-        thread_interrupt(p->thread);
+    if (t != thread_current())
+        thread_interrupt(t);
+}
+
+static void interrupt_all(struct proc *p)
+{
+    for (struct thread *t = p->threads; t; t = t->tg_next)
+        interrupt(t);
+}
+
+static void save_info(struct proc *p, int sig, const struct ksiginfo *info)
+{
+    if (info)
+        p->siginfo[sig - 1] = *info;
+    else
+        memset(&p->siginfo[sig - 1], 0, sizeof p->siginfo[0]);
 }
 
 void signal_send(struct proc *p, int sig, const struct ksiginfo *info)
@@ -110,39 +112,81 @@ void signal_send(struct proc *p, int sig, const struct ksiginfo *info)
     if (sig < 1 || sig > NSIG)
         return;
     uint64_t flags = irq_save();
-    // linux drops ignored signals right away, even blocked ones
-    if (sig == SIGKILL || !ignored(p, sig))
-        queue(p, sig, info);
+    if (sig == SIGKILL) {
+        p->killed = true;
+        interrupt_all(p);
+    } else if (!ignored(p, sig)) {
+        // linux drops ignored signals right away, even blocked ones
+        p->sig_pending |= SIGBIT(sig);
+        save_info(p, sig, info);
+        // wake one thread that will take it
+        for (struct thread *t = p->threads; t; t = t->tg_next) {
+            if (t->sig_blocked & SIGBIT(sig))
+                continue;
+            if (t == p->thread && p->main_gone)
+                continue;
+            interrupt(t);
+            break;
+        }
+    }
     irq_restore(flags);
 }
 
-void signal_force(struct proc *p, int sig, const struct ksiginfo *info)
+void signal_send_thread(struct thread *t, int sig, const struct ksiginfo *info)
 {
+    struct proc *p = t->proc;
+    if (sig < 1 || sig > NSIG || !p)
+        return;
+    if (sig == SIGKILL) {
+        signal_send(p, sig, info);
+        return;
+    }
+    uint64_t flags = irq_save();
+    if (!ignored(p, sig)) {
+        t->sig_pending |= SIGBIT(sig);
+        save_info(p, sig, info);
+        if (!(t->sig_blocked & SIGBIT(sig)))
+            interrupt(t);
+    }
+    irq_restore(flags);
+}
+
+void signal_force(struct thread *t, int sig, const struct ksiginfo *info)
+{
+    struct proc *p = t->proc;
     uint64_t flags = irq_save();
     struct ksigaction *a = &p->sigact[sig - 1];
-    if (a->handler == SIG_IGN || (p->sig_blocked & SIGBIT(sig)))
+    if (a->handler == SIG_IGN || (t->sig_blocked & SIGBIT(sig)))
         a->handler = SIG_DFL;
-    p->sig_blocked &= ~SIGBIT(sig);
-    queue(p, sig, info);
+    t->sig_blocked &= ~SIGBIT(sig);
+    t->sig_pending |= SIGBIT(sig);
+    save_info(p, sig, info);
     irq_restore(flags);
 }
 
-bool signal_pending(struct proc *p)
+bool signal_pending(struct thread *t)
 {
-    return p->killed || (p->sig_pending & ~p->sig_blocked);
+    struct proc *p = t->proc;
+    if (!p)
+        return false;
+    if (p->killed || p->group_exit || (p->kill_others && t != p->thread))
+        return true;
+    return (p->sig_pending | t->sig_pending) & ~t->sig_blocked;
 }
 
-void signal_fork(struct proc *child, const struct proc *parent)
+void signal_fork(struct proc *child, struct thread *ct, const struct proc *parent,
+                 const struct thread *pt)
 {
     memcpy(child->sigact, parent->sigact, sizeof child->sigact);
-    child->sig_blocked = parent->sig_blocked;
     child->sig_pending = 0;
-    child->altstack_sp = parent->altstack_sp;
-    child->altstack_size = parent->altstack_size;
-    child->altstack_flags = parent->altstack_flags;
+    ct->sig_pending = 0;
+    ct->sig_blocked = pt->sig_blocked;
+    ct->altstack_sp = pt->altstack_sp;
+    ct->altstack_size = pt->altstack_size;
+    ct->altstack_flags = pt->altstack_flags;
 }
 
-void signal_exec(struct proc *p)
+void signal_exec(struct proc *p, struct thread *t)
 {
     // handlers point into the old image, ignored stays ignored
     for (int i = 0; i < NSIG; i++) {
@@ -152,9 +196,9 @@ void signal_exec(struct proc *p)
         p->sigact[i].mask = 0;
         p->sigact[i].restorer = 0;
     }
-    p->altstack_sp = 0;
-    p->altstack_size = 0;
-    p->altstack_flags = SS_DISABLE;
+    t->altstack_sp = 0;
+    t->altstack_size = 0;
+    t->altstack_flags = SS_DISABLE;
 }
 
 __attribute__((noreturn)) static void die(int sig)
@@ -174,14 +218,14 @@ static bool restartable(int64_t nr)
     return true;
 }
 
-static bool on_altstack(struct proc *p, uint64_t sp)
+static bool on_altstack(struct thread *p, uint64_t sp)
 {
     return p->altstack_size && sp > p->altstack_sp &&
            sp <= p->altstack_sp + p->altstack_size;
 }
 
 // false if the user stack is unusable
-static bool push_frame(struct proc *p, struct interrupt_frame *f, int sig,
+static bool push_frame(struct thread *p, struct interrupt_frame *f, int sig,
                        const struct ksigaction *a, const struct ksiginfo *si)
 {
     uint64_t sp = f->rsp;
@@ -250,7 +294,8 @@ static bool push_frame(struct proc *p, struct interrupt_frame *f, int sig,
 
 void signal_return(struct interrupt_frame *f, int64_t syscall)
 {
-    struct proc *p = proc_current();
+    struct thread *t = thread_current();
+    struct proc *p = t->proc;
     if (!p)
         return;
     bool eintr = syscall >= 0 && (int64_t)f->rax == -LINUX_EINTR;
@@ -258,14 +303,22 @@ void signal_return(struct interrupt_frame *f, int64_t syscall)
     for (;;) {
         if (p->killed)
             die(SIGKILL);
+        // another thread is ending the process, or exec wants us gone
+        if (p->group_exit || (p->kill_others && t != p->thread)) {
+            sti();
+            proc_thread_exit(0);
+        }
         uint64_t flags = irq_save();
-        uint64_t bits = p->sig_pending & ~p->sig_blocked;
+        uint64_t bits = (t->sig_pending | p->sig_pending) & ~t->sig_blocked;
         if (!bits) {
             irq_restore(flags);
             break;
         }
         int sig = __builtin_ctzll(bits) + 1;
-        p->sig_pending &= ~SIGBIT(sig);
+        if (t->sig_pending & SIGBIT(sig))
+            t->sig_pending &= ~SIGBIT(sig);
+        else
+            p->sig_pending &= ~SIGBIT(sig);
         struct ksiginfo si = p->siginfo[sig - 1];
         struct ksigaction a = p->sigact[sig - 1];
         irq_restore(flags);
@@ -285,25 +338,25 @@ void signal_return(struct interrupt_frame *f, int64_t syscall)
             f->rax = (uint64_t)syscall;
             f->rip -= 2;    // back onto the syscall instruction
         }
-        if (!push_frame(p, f, sig, &a, &si))
+        if (!push_frame(t, f, sig, &a, &si))
             die(SIGSEGV);
 
         flags = irq_save();
-        p->sig_restore = false;
+        t->sig_restore = false;
         if (a.flags & SA_RESETHAND)
             p->sigact[sig - 1].handler = SIG_DFL;
-        p->sig_blocked |= a.mask & ~SIG_UNBLOCKABLE;
+        t->sig_blocked |= a.mask & ~SIG_UNBLOCKABLE;
         if (!(a.flags & SA_NODEFER))
-            p->sig_blocked |= SIGBIT(sig);
+            t->sig_blocked |= SIGBIT(sig);
         irq_restore(flags);
         // one handler at a time, the rest wait for rt_sigreturn
         return;
     }
 
-    if (p->sig_restore) {
+    if (t->sig_restore) {
         uint64_t flags = irq_save();
-        p->sig_blocked = p->sig_saved;
-        p->sig_restore = false;
+        t->sig_blocked = t->sig_saved;
+        t->sig_restore = false;
         irq_restore(flags);
     }
     // interrupted, but nothing ran: go back in as if nothing happened
@@ -315,7 +368,7 @@ void signal_return(struct interrupt_frame *f, int64_t syscall)
 
 void signal_sigreturn(struct interrupt_frame *f)
 {
-    struct proc *p = proc_current();
+    struct thread *p = thread_current();
     // the handler's ret popped pretcode, so the ucontext starts at rsp
     uint64_t uc_addr = f->rsp;
     struct l_ucontext uc;

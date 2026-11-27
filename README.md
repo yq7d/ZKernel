@@ -50,7 +50,8 @@ This uses Alpine and not the Arch AUR because AUR packages are build scripts. Th
 ### Linux programs
 ZOS runs x86_64 Linux binaries, both static ones (glibc or musl) and Alpine's dynamically linked musl ones. Like FreeBSD's Linux layer, Linux programs see `/compat/linux` laid over `/`: a path that exists in there wins.
 Signals work like on Linux: handlers (with `SA_SIGINFO`, `SA_RESTART`, `SA_ONSTACK`), masks, `sigsuspend`, `sigaltstack`, faults as catchable `SIGSEGV`/`SIGILL`/`SIGFPE`, `SIGCHLD`, and wait statuses that say which signal killed a child. Ctrl+C sends `SIGINT` and Ctrl+\ sends `SIGQUIT`.
-What doesn't work yet: threads, job control (Ctrl+Z, `SIGSTOP`), `alarm`, listening sockets, and anything that reads Linux's own `/proc` files (so `htop` installs but can't show anything).
+Threads work too: `clone` with `CLONE_THREAD`, futexes, thread local storage, `pthread_kill`, so glibc and musl pthreads (mutexes, condition variables, semaphores, barriers, join) run, and `xz -T4` from Alpine compresses on four threads.
+What doesn't work yet: job control (Ctrl+Z, `SIGSTOP`), `alarm`, listening sockets, and anything that reads Linux's own `/proc` files (so `htop` installs but can't show anything).
 
 ### Files that stay
 Disks are found by filesystem label (see `/etc/fstab`), so it doesn't matter what the disk is called:
@@ -96,11 +97,11 @@ x86_64, boots with Limine (BIOS and UEFI), single cpu.
 - **users:** uids, gids, groups, file permissions, set-user-id programs, `sudo`, `su`, `passwd`
 - **files:** VFS with mounts and symlinks, ramfs root unpacked from an initrd, ext2 and FAT32 (both read/write, and both can be created with `mkfs.ext2` / `mkfs.fat`), MBR and GPT partitions, bind mounts, `/proc`, `/dev`, pipes, a write-back disk cache
 - **network:** virtio-net, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS, sockets, an HTTP client (`fetch`, `ping`, `host`, `ifconfig`)
-- **linux:** a compatibility layer for x86_64 Linux programs (around 150 syscalls), including musl's dynamic loader
+- **linux:** a compatibility layer for x86_64 Linux programs (around 160 syscalls), including musl's dynamic loader, signals and threads
 - **drivers:** framebuffer console, PS/2 keyboard and mouse, serial (input and output), PIT timer, CMOS clock, PCI, ACPI power off and reset, AHCI, NVMe, virtio-blk, e1000/e1000e, virtio-net
 - **graphics and terminals:** `/dev/fb0` that programs can map, raw key and mouse events (`/dev/kbd`, `/dev/mouse`), pseudo terminals, `poll`
 - **userland:** `init`, the `zwm` desktop, `zos-install`, `pkg`, `zfetch`, a shell (`/bin/sh`) with pipes, redirects, background jobs, `;` `&&` `||`, variables, `~`, and about 70 commands: `ls cp mv rm mkdir cat grep sort head tail find df du mount ps kill sudo chmod chown`...
-- **tests:** kernel self tests run on every boot, `utest` tests the user side (malloc, fork, exec, fpu, files), `ltest` is a static glibc program that tests the Linux layer
+- **tests:** kernel self tests run on every boot, `utest` tests the user side (malloc, fork, exec, fpu, files), `ltest` is a static glibc program that tests the Linux layer (files, fork/exec, signals, pthreads)
 
 ## Building and running
 Arch: `./scripts/setup.sh` installs everything. Elsewhere you need gcc (with static glibc), nasm, ld, xorriso, limine, qemu, mtools, dosfstools, e2fsprogs and sfdisk.

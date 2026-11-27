@@ -52,6 +52,16 @@ struct thread {
     struct waitq *blocked_on;    // set while in a waitq
     bool timed_out;
     struct thread *all_next;
+
+    // user threads. the process (proc) owns the address space, fds and
+    // handlers. extra threads don't, so freeing them leaves those alone
+    struct thread *tg_next;      // next thread of the same process
+    bool extra;
+    uint64_t sig_blocked, sig_pending, sig_saved;
+    bool sig_restore;            // put sig_saved back, after rt_sigsuspend
+    uint64_t altstack_sp, altstack_size;
+    int altstack_flags;
+    uint64_t clear_tid;          // zeroed and futex woken when it exits
 };
 
 typedef void (*thread_fn)(void *arg);

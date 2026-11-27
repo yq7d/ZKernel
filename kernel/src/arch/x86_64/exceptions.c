@@ -126,7 +126,7 @@ void exception_handle(struct interrupt_frame *f)
             sti();
             proc_exit(128 + (int)vec);
         }
-        signal_force(p, sig, &si);
+        signal_force(t, sig, &si);
         signal_return(f, -1);
         return;
     }
