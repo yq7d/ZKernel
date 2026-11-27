@@ -1,4 +1,4 @@
-#include "console/font.h"
+#include "lib/font.h"
 
 #define PSF1_MAGIC0     0x36
 #define PSF1_MAGIC1     0x04

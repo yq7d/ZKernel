@@ -1,4 +1,4 @@
-// printf format [args...]: %s %d %i %u %x %c %%, and \n \t \\ escapes
+// printf format [args...]: %s %d %i %u %x %c %%, and \n \t \e \NNN \xHH escapes
 #include "zk.h"
 
 int main(int argc, char **argv)
@@ -15,8 +15,24 @@ int main(int argc, char **argv)
     for (; *f; f++) {
         if (*f == '\\' && f[1]) {
             f++;
-            PUT(*f == 'n' ? '\n' : *f == 't' ? '\t' : *f == 'r' ? '\r' :
-                *f == 'e' ? '\e' : *f);
+            if (*f >= '0' && *f <= '7') {
+                // \NNN or \0NNN, octal
+                int v = 0, digits = *f == '0' ? 4 : 3;
+                for (int k = 0; k < digits && *f >= '0' && *f <= '7'; k++, f++)
+                    v = v * 8 + (*f - '0');
+                f--;
+                PUT((char)v);
+            } else if (*f == 'x' && isalnum(f[1])) {
+                int v = 0;
+                for (int k = 0; k < 2 && isalnum(f[1]); k++) {
+                    char h = (char)tolower(*++f);
+                    v = v * 16 + (h <= '9' ? h - '0' : h - 'a' + 10);
+                }
+                PUT((char)v);
+            } else {
+                PUT(*f == 'n' ? '\n' : *f == 't' ? '\t' : *f == 'r' ? '\r' :
+                    *f == 'e' ? '\e' : *f == 'a' ? '\a' : *f);
+            }
             continue;
         }
         if (*f != '%' || !f[1]) {

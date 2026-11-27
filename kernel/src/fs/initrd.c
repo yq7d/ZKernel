@@ -82,13 +82,30 @@ int initrd_unpack(const void *data, size_t size)
 
         if (vfs_normalize("/", raw, path) == 0 && strcmp(path, "/") != 0) {
             make_parents(path);
+            uint32_t mode = (uint32_t)octal(h->mode, sizeof h->mode) & 07777;
+            uint32_t uid = (uint32_t)octal(h->uid, sizeof h->uid);
+            uint32_t gid = (uint32_t)octal(h->gid, sizeof h->gid);
             if (h->type == '5') {
                 vfs_mkdir(path);
+                vfs_chmod(path, mode);
+                vfs_chown(path, uid, gid);
+                struct vnode *dv;
+                if (vfs_lookup(path, &dv) == 0) {
+                    dv->mtime = (int64_t)octal(h->mtime, sizeof h->mtime);
+                    vnode_put(dv);
+                }
+            } else if (h->type == '2') {
+                char target[101];
+                memcpy(target, h->link, 100);
+                target[100] = '\0';
+                if (vfs_symlink(target, path) == 0)
+                    files++;
             } else if (h->type == '0' || h->type == '\0') {
                 struct file *f;
                 if (vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC, &f) == 0) {
                     if (file_write(f, base + off, fsize) == (int64_t)fsize) {
                         f->v->mtime = (int64_t)octal(h->mtime, sizeof h->mtime);
+                        f->v->ops->setattr(f->v, uid, gid, mode);
                         files++;
                     }
                     else

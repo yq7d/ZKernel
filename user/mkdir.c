@@ -8,12 +8,14 @@ static int make(char *path, bool parents)
             if (*p != '/')
                 continue;
             *p = '\0';
-            int err = mkdir(path);
-            *p = '/';
+            struct zk_stat st;
+            int err = stat(path, &st) == 0 && st.type == ZK_TYPE_DIR ? 0 : mkdir(path);
             if (err && err != ZK_EEXIST) {
                 dprintf(2, "mkdir: %s: %s\n", path, strerror(err));
+                *p = '/';
                 return 1;
             }
+            *p = '/';
         }
     }
     int err = mkdir(path);

@@ -68,6 +68,34 @@ int strcasecmp(const char *a, const char *b)
     return tolower((unsigned char)*a) - tolower((unsigned char)*b);
 }
 
+char *strtok_r(char *s, const char *delim, char **save)
+{
+    if (!s)
+        s = *save;
+    if (!s)
+        return NULL;
+    while (*s && strchr(delim, *s))
+        s++;
+    if (!*s) {
+        *save = NULL;
+        return NULL;
+    }
+    char *tok = s;
+    while (*s && !strchr(delim, *s))
+        s++;
+    if (*s)
+        *s++ = '\0';
+    *save = s;
+    return tok;
+}
+
+int strncasecmp(const char *a, const char *b, size_t n)
+{
+    for (; n && *a && tolower(*a) == tolower(*b); a++, b++, n--)
+        ;
+    return n ? tolower((unsigned char)*a) - tolower((unsigned char)*b) : 0;
+}
+
 // merge sort, so it's stable
 static void msort(char *base, char *tmp, size_t n, size_t size,
                   int (*cmp)(const void *, const void *))

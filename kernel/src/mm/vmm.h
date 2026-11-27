@@ -13,6 +13,7 @@ struct limine_memmap_response;
 #define PTE_HUGE    (1UL << 7)
 #define PTE_GLOBAL  (1UL << 8)
 #define PTE_COW     (1UL << 9)    // available bit: read only until written, then copied
+#define PTE_NOFREE  (1UL << 10)   // available bit: device memory, not ours to free
 #define PTE_NX      (1UL << 63)
 
 void vmm_init(struct limine_memmap_response *memmap,
@@ -23,6 +24,10 @@ bool vmm_map(uint64_t virt, uint64_t phys, uint64_t flags);
 void vmm_unmap(uint64_t virt);
 bool vmm_translate(uint64_t virt, uint64_t *phys);
 
+// device registers: maps phys..phys+size uncached in the hhdm window, returns
+// the virtual address. ranges already mapped there are left alone
+void *vmm_map_mmio(uint64_t phys, size_t size);
+
 // returns the top of a new stack, with an unmapped guard page under it
 uint64_t vmm_alloc_stack(size_t pages);
 void vmm_free_stack(uint64_t top, size_t pages);
@@ -32,7 +37,11 @@ bool vmm_is_guard_page(uint64_t addr);
 struct address_space {
     uint64_t pml4_phys;
     uint64_t *pml4;
-    uint64_t heap_top;    // next address handed out by sys_alloc
+    uint64_t heap_top;      // next address handed out by sys_alloc
+    uint64_t brk_start, brk;
+    uint64_t mmap_next;     // mmap hands out addresses downwards from here
+    uint64_t stack_low;     // the stack may grow down to here on faults
+    uint64_t stack_top;
 };
 
 struct address_space *vmm_create_space(void);
@@ -40,6 +49,14 @@ struct address_space *vmm_create_space(void);
 void vmm_destroy_space(struct address_space *as);
 bool vmm_map_user(struct address_space *as, uint64_t virt, uint64_t phys, uint64_t flags);
 bool vmm_translate_user(struct address_space *as, uint64_t virt, uint64_t *phys);
+// removes a mapping without freeing the page
+void vmm_unmap_user(struct address_space *as, uint64_t virt);
+// removes a mapping and drops the page
+void vmm_free_user(struct address_space *as, uint64_t virt);
+// sets the write and nx bits of a mapped page, false if there's none
+bool vmm_protect_user(struct address_space *as, uint64_t virt, uint64_t flags);
+// maps a zeroed page if addr is in the stack's growth area
+bool vmm_grow_stack(struct address_space *as, uint64_t addr);
 bool vmm_user_range_ok(struct address_space *as, uint64_t addr, size_t len, bool write);
 // copy on write duplicate of the lower half, for fork
 struct address_space *vmm_clone_space(struct address_space *src);

@@ -1,8 +1,11 @@
 #include "console/console.h"
-#include "console/font.h"
+#include "lib/font.h"
 #include "drivers/fb.h"
 #include "lib/spinlock.h"
 #include "panic.h"
+
+// font.asm
+extern const uint8_t font_psf_start[], font_psf_end[];
 
 static const uint32_t palette[16] = {
     0x1d1f21, 0xcc6666, 0x8cb867, 0xe0b05a, 0x5f8fd0, 0xb07fcf, 0x5fb3b3, 0xc5c8c6,
@@ -28,6 +31,7 @@ static struct {
 
     bool cursor_drawn;
     uint32_t cursor_x, cursor_y;
+    bool suspended;    // a user program owns the framebuffer
 } con;
 
 static spinlock_t lock = SPINLOCK_INIT;
@@ -86,6 +90,8 @@ static void clear_locked(void)
 
 void console_clear(void)
 {
+    if (con.suspended)
+        return;
     uint64_t f = lock_console();
     clear_locked();
     unlock_console(f);
@@ -114,6 +120,8 @@ static void cursor_hide_locked(void)
 
 void console_cursor_show(void)
 {
+    if (con.suspended)
+        return;
     if (!con.ready)
         return;
     uint64_t f = lock_console();
@@ -128,6 +136,8 @@ void console_cursor_show(void)
 
 void console_cursor_hide(void)
 {
+    if (con.suspended)
+        return;
     if (!con.ready)
         return;
     uint64_t f = lock_console();
@@ -277,9 +287,38 @@ static void putc_locked(char ch)
     draw_char(con.cx++, con.cy, c);
 }
 
+uint32_t console_cols(void)
+{
+    return con.cols;
+}
+
+uint32_t console_rows(void)
+{
+    return con.rows;
+}
+
+void console_suspend(bool on)
+{
+    uint64_t f = lock_console();
+    con.suspended = on;
+    if (!on)
+        clear_locked();
+    unlock_console(f);
+}
+
+// a panic always gets the screen back
+static bool hidden(void)
+{
+    if (con.suspended && panic_in_progress()) {
+        con.suspended = false;
+        clear_locked();
+    }
+    return con.suspended;
+}
+
 void console_putc(char c)
 {
-    if (!con.ready)
+    if (!con.ready || hidden())
         return;
     uint64_t f = lock_console();
     cursor_hide_locked();
@@ -289,7 +328,7 @@ void console_putc(char c)
 
 void console_write(const char *s, size_t n)
 {
-    if (!con.ready)
+    if (!con.ready || hidden())
         return;
     uint64_t f = lock_console();
     cursor_hide_locked();

@@ -49,8 +49,41 @@ static struct thread *dequeue(struct waitq *q)
     return t;
 }
 
+static void unlink_sleeper(struct thread *t)
+{
+    for (struct thread **p = &sleepers; *p; p = &(*p)->sleep_next) {
+        if (*p == t) {
+            *p = t->sleep_next;
+            return;
+        }
+    }
+}
+
+static void unlink_waiter(struct waitq *q, struct thread *t)
+{
+    struct thread *prev = NULL;
+    for (struct thread *c = q->head; c; prev = c, c = c->next) {
+        if (c != t)
+            continue;
+        if (prev)
+            prev->next = c->next;
+        else
+            q->head = c->next;
+        if (q->tail == c)
+            q->tail = prev;
+        c->next = NULL;
+        return;
+    }
+}
+
 static void make_ready(struct thread *t)
 {
+    // woken through the queue before the timeout hit
+    if (t->timed_wq) {
+        unlink_sleeper(t);
+        t->timed_wq = NULL;
+        t->timed_out = false;
+    }
     t->state = THREAD_READY;
     enqueue(&ready, t);
     if (current == idle_thread)
@@ -86,6 +119,8 @@ static void schedule(void)
     vmm_activate(next->as);
     fpu_save(prev->fpu);
     fpu_restore(next->fpu);
+    if (prev->fs_base != next->fs_base)
+        wrmsr(MSR_FS_BASE, next->fs_base);
     switch_context(&prev->rsp, next->rsp);
 }
 
@@ -304,7 +339,7 @@ void thread_sleep_ms(uint64_t ms)
     uint64_t flags = irq_save();
     current->wake_tick = timer_ticks() + ticks;
     current->state = THREAD_SLEEPING;
-    current->next = sleepers;
+    current->sleep_next = sleepers;
     sleepers = current;
     schedule();
     irq_restore(flags);
@@ -315,6 +350,20 @@ void waitq_sleep(struct waitq *wq)
     current->state = THREAD_BLOCKED;
     enqueue(wq, current);
     schedule();
+}
+
+bool waitq_sleep_timeout(struct waitq *wq, uint64_t ms)
+{
+    uint64_t ticks = (ms * TIMER_HZ + 999) / 1000;
+    current->state = THREAD_BLOCKED;
+    enqueue(wq, current);
+    current->timed_wq = wq;
+    current->timed_out = false;
+    current->wake_tick = timer_ticks() + (ticks ? ticks : 1);
+    current->sleep_next = sleepers;
+    sleepers = current;
+    schedule();
+    return !current->timed_out;
 }
 
 void waitq_wake_one(struct waitq *wq)
@@ -348,10 +397,15 @@ void sched_tick(void)
     while (*p) {
         struct thread *t = *p;
         if (now >= t->wake_tick) {
-            *p = t->next;
+            *p = t->sleep_next;
+            if (t->timed_wq) {
+                unlink_waiter(t->timed_wq, t);
+                t->timed_wq = NULL;
+                t->timed_out = true;
+            }
             make_ready(t);
         } else {
-            p = &t->next;
+            p = &t->sleep_next;
         }
     }
 

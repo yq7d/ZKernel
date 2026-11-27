@@ -7,3 +7,5 @@
 // sets up the 8042 with port 1 enabled, irq 1 on, scancode translation on
 bool ps2_init(void);
 void ps2_reboot(void);
+// second port. call after ps2_init
+bool ps2_mouse_init(void);

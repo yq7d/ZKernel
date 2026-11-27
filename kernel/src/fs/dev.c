@@ -1,4 +1,7 @@
 #include "fs/vfs.h"
+#include "drivers/fbdev.h"
+#include "drivers/keyboard.h"
+#include "drivers/mouse.h"
 #include "drivers/tty.h"
 #include "kprintf.h"
 #include "lib/string.h"
@@ -28,9 +31,11 @@ static const struct vnode_ops zero_ops = { .read = zero_read, .write = null_writ
 static struct vnode null_vnode = { .type = VNODE_DEV, .refs = 1, .ops = &null_ops };
 static struct vnode zero_vnode = { .type = VNODE_DEV, .refs = 1, .ops = &zero_ops };
 
-static void add(const char *path, struct vnode *v)
+static void add(const char *path, struct vnode *v, uint32_t mode, uint32_t gid)
 {
     v->ino = vfs_next_ino();
+    v->mode = mode;
+    v->gid = gid;
     int err = vfs_mknod(path, v);
     if (err)
         pr_warn("dev: can't create %s (%d)\n", path, err);
@@ -38,7 +43,12 @@ static void add(const char *path, struct vnode *v)
 
 void dev_init(void)
 {
-    add("/dev/console", &tty_vnode);
-    add("/dev/null", &null_vnode);
-    add("/dev/zero", &zero_vnode);
+    // groups from /etc/group: input 20, video 21
+    add("/dev/console", &tty_vnode, 0666, 0);
+    add("/dev/null", &null_vnode, 0666, 0);
+    add("/dev/zero", &zero_vnode, 0666, 0);
+    add("/dev/tty", &devtty_vnode, 0666, 0);
+    add("/dev/kbd", &kbd_vnode, 0660, 20);
+    add("/dev/mouse", &mouse_vnode, 0660, 20);
+    add("/dev/fb0", &fb_vnode, 0660, 21);
 }

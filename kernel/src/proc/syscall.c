@@ -1,4 +1,5 @@
 #include "proc/proc.h"
+#include "proc/sys.h"
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/power.h"
 #include "arch/x86_64/interrupts.h"
@@ -6,15 +7,17 @@
 #include "drivers/rtc.h"
 #include "drivers/tty.h"
 #include "fs/vfs.h"
+#include "lib/random.h"
 #include "lib/string.h"
 #include "mm/heap.h"
+#include "net/net.h"
 #include "mm/mm.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "sched/sched.h"
 #include <zk/syscall.h>
 
-#define MAX_ALLOC_PAGES 4096
+#define MAX_ALLOC_PAGES (64 * 1024)
 #define MAX_PS          64
 
 static struct address_space *cur_as(void)
@@ -22,13 +25,29 @@ static struct address_space *cur_as(void)
     return thread_current()->as;
 }
 
-static bool user_ok(uint64_t addr, size_t len, bool write)
+bool user_ok(uint64_t addr, size_t len, bool write)
 {
     return vmm_user_range_ok(cur_as(), addr, len, write);
 }
 
+int copy_out(uint64_t dst, const void *src, size_t len)
+{
+    if (!user_ok(dst, len, true))
+        return ZK_EFAULT;
+    memcpy((void *)dst, src, len);
+    return 0;
+}
+
+int copy_in(void *dst, uint64_t src, size_t len)
+{
+    if (!user_ok(src, len, false))
+        return ZK_EFAULT;
+    memcpy(dst, (const void *)src, len);
+    return 0;
+}
+
 // copies a nul terminated user string into buf
-static int get_string(uint64_t addr, char *buf, size_t size)
+int get_string(uint64_t addr, char *buf, size_t size)
 {
     for (size_t i = 0; i < size; i++) {
         if ((i == 0 || (addr + i) % PAGE_SIZE == 0) && !user_ok(addr + i, 1, false))
@@ -41,7 +60,7 @@ static int get_string(uint64_t addr, char *buf, size_t size)
 }
 
 // user path -> absolute normalized path
-static int get_path(uint64_t addr, char *out)
+int get_path(uint64_t addr, char *out)
 {
     char raw[ZK_PATH_MAX];
     int err = get_string(addr, raw, sizeof raw);
@@ -190,12 +209,6 @@ static int64_t sys_getcwd(uint64_t buf, size_t size)
     return (int64_t)len;
 }
 
-// a NULL terminated user string array, copied into the kernel
-struct strv {
-    char *ptrs[PROC_MAX_ENV + 1];
-    char *buf;
-    size_t used;
-};
 
 static int get_strv(uint64_t uv, struct strv *v, int max)
 {
@@ -223,14 +236,9 @@ static int get_strv(uint64_t uv, struct strv *v, int max)
     return 0;
 }
 
-struct exec_args {
-    char path[ZK_PATH_MAX];
-    struct strv argv, envp;
-    char buf[];
-};
 
 // path, argv and envp in one allocation, free with kfree
-static int get_exec_args(uint64_t upath, uint64_t uargv, uint64_t uenvp, struct exec_args **out)
+int get_exec_args(uint64_t upath, uint64_t uargv, uint64_t uenvp, struct exec_args **out)
 {
     struct exec_args *a = kmalloc(sizeof(*a) + PROC_MAX_ARG_BYTES);
     if (!a)
@@ -298,7 +306,7 @@ static int64_t sys_wait(int64_t pid, uint64_t ustatus, int flags)
     return proc_wait(pid, (int *)ustatus, flags);
 }
 
-static int64_t sys_pipe(uint64_t ufds)
+int64_t sys_pipe(uint64_t ufds)
 {
     if (!user_ok(ufds, 2 * sizeof(int), true))
         return ZK_EFAULT;
@@ -357,10 +365,19 @@ static int64_t sys_rename(uint64_t ufrom, uint64_t uto)
     return err ? err : vfs_rename(from, to);
 }
 
-static int64_t sys_mount(uint64_t usrc, uint64_t utarget, uint64_t utype)
+static bool is_root(void)
 {
-    char src[ZK_PATH_MAX], target[ZK_PATH_MAX], type[16];
+    return proc_current()->cred.euid == 0;
+}
+
+static int64_t sys_mount(uint64_t usrc, uint64_t utarget, uint64_t utype, uint64_t uopts)
+{
+    if (!is_root())
+        return ZK_EPERM;
+    char src[ZK_PATH_MAX], target[ZK_PATH_MAX], type[16], opts[64] = "";
     int err = get_string(usrc, src, sizeof src);
+    if (!err && uopts)
+        err = get_string(uopts, opts, sizeof opts);
     if (!err)
         err = get_path(utarget, target);
     if (!err)
@@ -375,10 +392,10 @@ static int64_t sys_mount(uint64_t usrc, uint64_t utarget, uint64_t utype)
             return err;
         strlcpy(src, abs, sizeof src);
     }
-    return vfs_mount(src, target, type);
+    return vfs_mount(src, target, type, opts);
 }
 
-static int64_t sys_statfs(uint64_t upath, uint64_t ust)
+int64_t sys_statfs(uint64_t upath, uint64_t ust)
 {
     char path[ZK_PATH_MAX];
     int err = get_path(upath, path);
@@ -403,12 +420,166 @@ static int64_t sys_ftruncate(int fd, uint64_t size)
     return vfs_truncate(f->v, size);
 }
 
+static int64_t sys_ioctl(int fd, unsigned long req, uint64_t arg)
+{
+    struct file *f = get_fd(fd);
+    return f ? file_ioctl(f, req, arg) : ZK_EBADF;
+}
+
+#define MAX_POLL 64
+
+int64_t sys_poll(uint64_t ufds, size_t n, int64_t timeout)
+{
+    if (n > MAX_POLL)
+        return ZK_EINVAL;
+    struct zk_pollfd fds[MAX_POLL];
+    if (n && copy_in(fds, ufds, n * sizeof(fds[0])))
+        return ZK_EFAULT;
+    struct proc *me = proc_current();
+    uint64_t deadline = timeout > 0 ? timer_uptime_ms() + (uint64_t)timeout : 0;
+
+    int ready = 0;
+    // interrupts stay off between checking and sleeping, so no wakeup is missed
+    uint64_t flags = irq_save();
+    for (;;) {
+        ready = 0;
+        for (size_t i = 0; i < n; i++) {
+            fds[i].revents = 0;
+            if (fds[i].fd < 0)
+                continue;
+            struct file *f = proc_fd_get(me, fds[i].fd);
+            int r = f ? file_poll(f) : POLLNVAL;
+            fds[i].revents = (int16_t)(r & (fds[i].events | POLLHUP | POLLNVAL));
+            if (fds[i].revents)
+                ready++;
+        }
+        if (ready || timeout == 0)
+            break;
+        if (me->killed) {
+            ready = ZK_EINTR;
+            break;
+        }
+        int64_t left = -1;
+        if (timeout > 0) {
+            uint64_t now = timer_uptime_ms();
+            if (now >= deadline)
+                break;
+            left = (int64_t)(deadline - now);
+        }
+        poll_wait(left);
+    }
+    irq_restore(flags);
+    if (n && copy_out(ufds, fds, n * sizeof(fds[0])))
+        return ZK_EFAULT;
+    return ready;
+}
+
+static int64_t sys_openpty(uint64_t ufds)
+{
+    if (!user_ok(ufds, 2 * sizeof(int), true))
+        return ZK_EFAULT;
+    struct proc *p = proc_current();
+    struct file *m, *s;
+    int err = pty_create(&m, &s);
+    if (err)
+        return err;
+    int a = proc_fd_alloc(p, m);
+    int b = a < 0 ? a : proc_fd_alloc(p, s);
+    if (b < 0) {
+        if (a >= 0)
+            p->fds[a] = NULL;
+        file_put(m);
+        file_put(s);
+        return ZK_EMFILE;
+    }
+    ((int *)ufds)[0] = a;
+    ((int *)ufds)[1] = b;
+    return 0;
+}
+
+int64_t sys_setuid(uint32_t uid)
+{
+    struct zk_cred *c = &proc_current()->cred;
+    if (c->euid == 0) {
+        c->uid = c->euid = c->suid = uid;
+        return 0;
+    }
+    if (uid != c->uid && uid != c->suid)
+        return ZK_EPERM;
+    c->euid = uid;
+    return 0;
+}
+
+int64_t sys_setgid(uint32_t gid)
+{
+    struct zk_cred *c = &proc_current()->cred;
+    if (c->euid == 0) {
+        c->gid = c->egid = c->sgid = gid;
+        return 0;
+    }
+    if (gid != c->gid && gid != c->sgid)
+        return ZK_EPERM;
+    c->egid = gid;
+    return 0;
+}
+
+int64_t sys_setgroups(size_t n, uint64_t ugroups)
+{
+    struct zk_cred *c = &proc_current()->cred;
+    if (c->euid != 0)
+        return ZK_EPERM;
+    if (n > ZK_NGROUPS)
+        return ZK_EINVAL;
+    uint32_t g[ZK_NGROUPS];
+    if (n && copy_in(g, ugroups, n * sizeof(uint32_t)))
+        return ZK_EFAULT;
+    memcpy(c->groups, g, n * sizeof(uint32_t));
+    c->ngroups = (uint32_t)n;
+    return 0;
+}
+
+static int64_t sys_chmod(uint64_t upath, uint32_t mode)
+{
+    char path[ZK_PATH_MAX];
+    int err = get_path(upath, path);
+    return err ? err : vfs_chmod(path, mode);
+}
+
+static int64_t sys_chown(uint64_t upath, uint32_t uid, uint32_t gid)
+{
+    char path[ZK_PATH_MAX];
+    int err = get_path(upath, path);
+    return err ? err : vfs_chown(path, uid, gid);
+}
+
+int64_t sys_kill(uint64_t pid)
+{
+    // only your own processes, unless you're root
+    struct zk_procinfo info[64];
+    int n = proc_snapshot(info, 64);
+    const struct zk_cred *c = cred_current();
+    for (int i = 0; i < n; i++)
+        if (info[i].pid == pid && c->euid != 0 && info[i].uid != c->uid && info[i].uid != c->euid)
+            return ZK_EPERM;
+    return proc_kill(pid);
+}
+
+int64_t sys_getrandom(uint64_t ubuf, size_t len)
+{
+    if (len > 4096)
+        len = 4096;
+    if (!user_ok(ubuf, len, true))
+        return ZK_EFAULT;
+    random_bytes((void *)ubuf, len);
+    return (int64_t)len;
+}
+
 static void syscall_handler(struct interrupt_frame *f)
 {
     // syscalls can take a while, let interrupts in
     sti();
 
-    uint64_t a = f->rdi, b = f->rsi, c = f->rdx, d = f->r10;
+    uint64_t a = f->rdi, b = f->rsi, c = f->rdx, d = f->r10, e = f->r8, g = f->r9;
     int64_t ret;
     switch (f->rax) {
     case SYS_EXIT:       proc_exit((int)a);
@@ -434,15 +605,83 @@ static void syscall_handler(struct interrupt_frame *f)
     case SYS_CHDIR:      ret = sys_chdir(a); break;
     case SYS_GETCWD:     ret = sys_getcwd(a, b); break;
     case SYS_SPAWN:      ret = sys_spawn(a, b, c, d); break;
-    case SYS_FORK:       ret = proc_fork(f); break;
+    case SYS_FORK:       ret = proc_fork(f, 0, 0); break;
     case SYS_RENAME:     ret = sys_rename(a, b); break;
     case SYS_TIME:       ret = rtc_now(); break;
-    case SYS_MOUNT:      ret = sys_mount(a, b, c); break;
-    case SYS_UMOUNT:     ret = path_op(a, vfs_umount); break;
+    case SYS_MOUNT:      ret = sys_mount(a, b, c, d); break;
+    case SYS_UMOUNT:     ret = is_root() ? path_op(a, vfs_umount) : ZK_EPERM; break;
     case SYS_SYNC:       vfs_sync(); ret = 0; break;
     case SYS_STATFS:     ret = sys_statfs(a, b); break;
     case SYS_FTRUNCATE:  ret = sys_ftruncate((int)a, b); break;
+    case SYS_IOCTL:      ret = sys_ioctl((int)a, b, c); break;
+    case SYS_POLL:       ret = sys_poll(a, b, (int64_t)c); break;
+    case SYS_OPENPTY:    ret = sys_openpty(a); break;
+    case SYS_GETCRED:    ret = copy_out(a, &proc_current()->cred, sizeof(struct zk_cred)); break;
+    case SYS_SETUID:     ret = sys_setuid((uint32_t)a); break;
+    case SYS_SETGID:     ret = sys_setgid((uint32_t)a); break;
+    case SYS_SETGROUPS:  ret = sys_setgroups(a, b); break;
+    case SYS_CHMOD:      ret = sys_chmod(a, (uint32_t)b); break;
+    case SYS_CHOWN:      ret = sys_chown(a, (uint32_t)b, (uint32_t)c); break;
+    case SYS_GETRANDOM:  ret = sys_getrandom(a, b); break;
+    case SYS_SYMLINK: {
+        char target[ZK_PATH_MAX], path[ZK_PATH_MAX];
+        ret = get_string(a, target, sizeof target);
+        if (!ret)
+            ret = get_path(b, path);
+        if (!ret)
+            ret = vfs_symlink(target, path);
+        break;
+    }
+    case SYS_READLINK: {
+        char path[ZK_PATH_MAX], target[ZK_PATH_MAX];
+        ret = get_path(a, path);
+        if (!ret)
+            ret = vfs_readlink(path, target, sizeof target);
+        if (!ret) {
+            size_t n = strlen(target) + 1;
+            ret = n > c ? ZK_ENAMETOOLONG : copy_out(b, target, n) ? ZK_EFAULT : (int64_t)n - 1;
+        }
+        break;
+    }
+    case SYS_LSTAT: {
+        char path[ZK_PATH_MAX];
+        struct zk_stat st;
+        ret = get_path(a, path);
+        if (!ret)
+            ret = vfs_lstat(path, &st);
+        if (!ret)
+            ret = copy_out(b, &st, sizeof st);
+        break;
+    }
+    case SYS_SOCKET:     ret = sys_socket((int)a, (int)b); break;
+    case SYS_CONNECT:    ret = sys_connect((int)a, b, (uint32_t)c); break;
+    case SYS_BIND:       ret = sys_bind((int)a, b, (uint32_t)c); break;
+    case SYS_SENDTO:     ret = sys_sendto((int)a, b, c, (int)d, e, (uint32_t)g); break;
+    case SYS_RECVFROM:   ret = sys_recvfrom((int)a, b, c, (int)d, e, g); break;
+    case SYS_GETSOCKNAME: ret = sys_getsockname((int)a, b, c, d != 0); break;
+    case SYS_SHUTDOWN:   ret = sys_shutdown((int)a, (int)b); break;
+    case SYS_NETINFO: {
+        struct zk_netinfo ni;
+        memcpy(ni.mac, netif.mac, 6);
+        ni.up = netif.up;
+        ni.pad = 0;
+        ni.ip = netif.ip;
+        ni.mask = netif.mask;
+        ni.gw = netif.gw;
+        ni.dns = netif.dns;
+        ni.rx_packets = netif.rx_packets;
+        ni.tx_packets = netif.tx_packets;
+        ni.rx_bytes = netif.rx_bytes;
+        ni.tx_bytes = netif.tx_bytes;
+        ret = copy_out(a, &ni, sizeof ni);
+        break;
+    }
+    case SYS_PING:       ret = net_ping((uint32_t)a, b > 10000 ? 10000 : b); break;
     case SYS_REBOOT:
+        if (!is_root()) {
+            ret = ZK_EPERM;
+            break;
+        }
         if (a == ZK_POWEROFF)
             machine_poweroff();
         if (a == ZK_REBOOT)
@@ -453,8 +692,8 @@ static void syscall_handler(struct interrupt_frame *f)
     case SYS_WAIT:       ret = sys_wait((int64_t)a, b, (int)c); break;
     case SYS_PIPE:       ret = sys_pipe(a); break;
     case SYS_DUP:        ret = sys_dup((int)a); break;
-    case SYS_KILL:       ret = proc_kill(a); break;
-    case SYS_TTY_SETFG:  tty_set_fg(a); ret = 0; break;
+    case SYS_KILL:       ret = sys_kill(a); break;
+    case SYS_TTY_SETFG:  ret = sys_ioctl(0, TIOCSFG, a); break;
     case SYS_PS:         ret = sys_ps(a, b); break;
     default:             ret = ZK_ENOSYS; break;
     }

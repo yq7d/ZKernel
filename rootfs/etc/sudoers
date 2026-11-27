@@ -1,0 +1,3 @@
+# who may use sudo: a user name, or %group
+root
+%wheel

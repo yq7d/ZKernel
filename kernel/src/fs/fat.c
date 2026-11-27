@@ -39,6 +39,7 @@ struct fat_sb {
     struct fat_node *root;
     bool unmounted;
     bool fsinfo_dirty;
+    uint32_t uid, gid, fmode, dmode;    // fat has no owners, the mount picks them
 };
 
 struct fat_node {
@@ -436,7 +437,9 @@ static struct fat_node *get_node(struct fat_sb *sb, const struct dent *d)
     bool dir = e[11] & ATTR_DIR;
     n->v = (struct vnode){ .type = dir ? VNODE_DIR : VNODE_FILE, .refs = 1,
                            .ino = vfs_next_ino(), .size = dir ? 0 : rd32(e + 28),
-                           .mtime = fat_epoch(rd16(e + 24), rd16(e + 22)), .ops = &ops };
+                           .mtime = fat_epoch(rd16(e + 24), rd16(e + 22)), .ops = &ops,
+                           .uid = sb->uid, .gid = sb->gid,
+                           .mode = dir ? sb->dmode : sb->fmode };
     n->sb = sb;
     n->first = ent_cluster(e);
     n->ent_off = off;
@@ -1198,7 +1201,7 @@ static int find_volume(struct blkdev *dev, uint64_t *off, uint8_t *bs)
     return ZK_EINVAL;
 }
 
-static int fat_mount(struct mount *m, const char *source)
+static int fat_mount(struct mount *m, const char *source, const char *opts)
 {
     struct blkdev *dev = blk_find(source);
     if (!dev)
@@ -1273,7 +1276,16 @@ static int fat_mount(struct mount *m, const char *source)
     }
     kfree(chunk);
 
-    root->v = (struct vnode){ .type = VNODE_DIR, .refs = 1, .ino = vfs_next_ino(), .ops = &ops };
+    sb->uid = sb->gid = 0;
+    sb->fmode = 0755;    // no exec bit on fat, so everything may run
+    sb->dmode = 0755;
+    mount_opt(opts, "uid", &sb->uid, 10);
+    mount_opt(opts, "gid", &sb->gid, 10);
+    uint32_t mode;
+    if (mount_opt(opts, "mode", &mode, 8))
+        sb->fmode = sb->dmode = mode & 0777;
+    root->v = (struct vnode){ .type = VNODE_DIR, .refs = 1, .ino = vfs_next_ino(), .ops = &ops,
+                              .uid = sb->uid, .gid = sb->gid, .mode = sb->dmode };
     root->sb = sb;
     root->first = sb->root_clus;
     sb->root = root;

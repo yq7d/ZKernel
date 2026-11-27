@@ -21,7 +21,11 @@ bool keyboard_init(void);
 // blocks until a key is pressed. returns ascii or a KEY_* code,
 // -1 if the calling process got killed
 int keyboard_getc(void);
-// queue a key as if it was typed, irq context or interrupts off
+// a key as if it was typed: to the console tty, or the kernel shell queue.
+// irq context or interrupts off
 void keyboard_inject(int c);
 // -1 if nothing is waiting
 int keyboard_trygetc(void);
+
+// /dev/kbd, raw key events. opening it takes the keyboard from the console
+extern struct vnode kbd_vnode;

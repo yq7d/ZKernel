@@ -6,13 +6,14 @@
 #   -n, --nographic   serial only, ctrl-a x to quit
 #   -m, --mem SIZE    default 512M
 #   -D, --disk FILE   raw disk image as virtio-blk
+#       --no-net      no network card
 #   -c, --cpus N      default 2
 #       --no-kvm
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ISO="$ROOT/build/zkernel.iso"
-UEFI=0 DEBUG=0 NOGRAPHIC=0 KVM=1 DISK=""
+UEFI=0 DEBUG=0 NOGRAPHIC=0 KVM=1 DISK="" NET=1
 MEM=512M CPUS=2
 
 while (($#)); do
@@ -24,7 +25,8 @@ while (($#)); do
         -D|--disk)      DISK="$2"; shift ;;
         -c|--cpus)      CPUS="$2"; shift ;;
         --no-kvm)       KVM=0 ;;
-        -h|--help)      sed -n '2,10p' "$0"; exit 0 ;;
+        --no-net)       NET=0 ;;
+        -h|--help)      sed -n '2,11p' "$0"; exit 0 ;;
         -*)             echo "Unknown option: $1" >&2; exit 1 ;;
         *)              ISO="$1" ;;
     esac
@@ -52,6 +54,13 @@ if [[ -n $DISK ]]; then
     # legacy virtio interface, that's what the driver speaks
     ARGS+=(-drive "file=$DISK,if=none,id=disk0,format=raw"
            -device virtio-blk-pci,drive=disk0,disable-modern=on)
+fi
+
+# user mode networking, the guest gets 10.0.2.15 over dhcp
+if (( NET )); then
+    ARGS+=(-netdev user,id=net0 -device virtio-net-pci,netdev=net0,disable-modern=on)
+else
+    ARGS+=(-nic none)
 fi
 
 # writing to port 0xf4 exits qemu

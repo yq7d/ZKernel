@@ -81,7 +81,10 @@ void gdt_init(void)
     __asm__ volatile ("ltr %0" : : "r"((uint16_t)GDT_TSS));
 }
 
+extern uint64_t syscall_kstack;
+
 void tss_set_kernel_stack(uint64_t rsp0)
 {
     tss.rsp[0] = rsp0;
+    syscall_kstack = rsp0;    // the syscall instruction needs it too
 }

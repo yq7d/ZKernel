@@ -6,6 +6,7 @@ static bool opt_long, opt_all, opt_human;
 
 struct ent {
     char name[ZK_NAME_MAX + 1];
+    char link[ZK_PATH_MAX];
     struct zk_stat st;
 };
 
@@ -19,12 +20,31 @@ static void print_ent(const struct ent *e)
     const char *color = e->st.type == ZK_TYPE_DIR ? "\e[1;34m" :
                         e->st.type == ZK_TYPE_DEV ? "\e[33m" : "";
     const char *suffix = e->st.type == ZK_TYPE_DIR ? "/" : "";
+    if (e->st.type == ZK_TYPE_LINK)
+        color = "\e[1;36m";
     if (!opt_long) {
         printf("%s%s\e[0m%s\n", color, e->name, suffix);
         return;
     }
-    char type = e->st.type == ZK_TYPE_DIR ? 'd' : e->st.type == ZK_TYPE_DEV ? 'c' :
-                e->st.type == ZK_TYPE_PIPE ? 'p' : '-';
+    char perm[11];
+    perm[0] = e->st.type == ZK_TYPE_DIR ? 'd' : e->st.type == ZK_TYPE_DEV ? 'c' :
+              e->st.type == ZK_TYPE_PIPE ? 'p' : e->st.type == ZK_TYPE_LINK ? 'l' : '-';
+    for (int i = 0; i < 9; i++)
+        perm[1 + i] = (e->st.mode >> (8 - i)) & 1 ? "rwxrwxrwx"[i] : '-';
+    if (e->st.mode & ZK_S_ISUID)
+        perm[3] = perm[3] == 'x' ? 's' : 'S';
+    if (e->st.mode & ZK_S_ISGID)
+        perm[6] = perm[6] == 'x' ? 's' : 'S';
+    if (e->st.mode & ZK_S_ISVTX)
+        perm[9] = perm[9] == 'x' ? 't' : 'T';
+    perm[10] = '\0';
+    char owner[32], group[32];
+    struct passwd pw;
+    if (getpwuid(e->st.uid, &pw) == 0)
+        strlcpy(owner, pw.name, sizeof owner);
+    else
+        snprintf(owner, sizeof owner, "%u", e->st.uid);
+    group_name(e->st.gid, group, sizeof group);
     char size[16];
     if (opt_human)
         format_size(e->st.size, size, sizeof size);
@@ -34,8 +54,11 @@ static void print_ent(const struct ent *e)
     epoch_to_datetime(e->st.mtime, &d);
     static const char *mon[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-    printf("%c %9s %s %2d %02d:%02d %s%s\e[0m%s\n", type, size,
+    printf("%s %-6s %-6s %9s %s %2d %02d:%02d %s%s\e[0m%s", perm, owner, group, size,
            mon[(d.month - 1) % 12], d.day, d.hour, d.min, color, e->name, suffix);
+    if (e->st.type == ZK_TYPE_LINK)
+        printf(" -> %s", e->link);
+    printf("\n");
 }
 
 static int list(const char *path, bool header)
@@ -49,6 +72,10 @@ static int list(const char *path, bool header)
     if (st.type != ZK_TYPE_DIR) {
         struct ent e;
         strlcpy(e.name, path, sizeof e.name);
+        e.link[0] = '\0';
+        lstat(path, &st);
+        if (st.type == ZK_TYPE_LINK)
+            readlink(path, e.link, sizeof e.link);
         e.st = st;
         print_ent(&e);
         return 0;
@@ -78,7 +105,10 @@ static int list(const char *path, bool header)
         strlcpy(ents[n].name, d.name, sizeof ents[n].name);
         memset(&ents[n].st, 0, sizeof ents[n].st);
         ents[n].st.type = d.type;
-        stat(child, &ents[n].st);
+        ents[n].link[0] = '\0';
+        lstat(child, &ents[n].st);
+        if (ents[n].st.type == ZK_TYPE_LINK)
+            readlink(child, ents[n].link, sizeof ents[n].link);
         n++;
     }
     close(fd);

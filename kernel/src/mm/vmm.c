@@ -10,7 +10,6 @@
 
 #define PTE_ADDR_MASK 0x000ffffffffff000UL
 #define HUGE_SIZE     0x200000UL
-#define MSR_EFER      0xC0000080
 #define EFER_NXE      (1UL << 11)
 #define CR0_WP        (1UL << 16)
 
@@ -230,6 +229,17 @@ static uint64_t reuse_stack(size_t pages)
     return top;
 }
 
+void *vmm_map_mmio(uint64_t phys, size_t size)
+{
+    uint64_t start = ALIGN_DOWN(phys, PAGE_SIZE), end = ALIGN_UP(phys + size, PAGE_SIZE);
+    for (uint64_t p = start; p < end; p += PAGE_SIZE) {
+        uint64_t virt = p + hhdm_offset;
+        if (!vmm_translate(virt, NULL) && !vmm_map(virt, p, PTE_WRITE | PTE_NX | PTE_PCD | PTE_PWT))
+            return NULL;
+    }
+    return phys_to_virt(phys);
+}
+
 uint64_t vmm_alloc_stack(size_t pages)
 {
     uint64_t top = reuse_stack(pages);
@@ -311,7 +321,7 @@ static void free_table(uint64_t *table, int level)
         uint64_t phys = e & PTE_ADDR_MASK;
         if (level > 1 && !(e & PTE_HUGE))
             free_table(phys_to_virt(phys), level - 1);
-        else
+        else if (!(e & PTE_NOFREE))
             pmm_free(phys);    // leaf: a page owned by the space
     }
     pmm_free(hhdm_to_phys(table));
@@ -345,6 +355,76 @@ bool vmm_map_user(struct address_space *as, uint64_t virt, uint64_t phys, uint64
     return ok;
 }
 
+void vmm_free_user(struct address_space *as, uint64_t virt)
+{
+    uint64_t irq = spin_lock_irqsave(&lock);
+    uint64_t *pte = pte_of(as->pml4, virt);
+    uint64_t e = pte ? *pte : 0;
+    if (e & PTE_PRESENT) {
+        *pte = 0;
+        if (read_cr3_phys() == as->pml4_phys)
+            invlpg(virt);
+    }
+    spin_unlock_irqrestore(&lock, irq);
+    if ((e & PTE_PRESENT) && !(e & PTE_NOFREE))
+        pmm_free(e & PTE_ADDR_MASK);
+}
+
+bool vmm_protect_user(struct address_space *as, uint64_t virt, uint64_t flags)
+{
+    uint64_t irq = spin_lock_irqsave(&lock);
+    uint64_t *pte = pte_of(as->pml4, virt);
+    bool ok = pte && (*pte & PTE_PRESENT);
+    if (ok) {
+        uint64_t e = *pte & ~(PTE_NX | PTE_WRITE);
+        e |= flags & PTE_NX;
+        // shared copy on write pages stay read only until a write copies
+        // them, the cow bit decides whether that write is allowed at all
+        if (flags & PTE_WRITE) {
+            if (pmm_refcount(e & PTE_ADDR_MASK) > 1 && !(e & PTE_NOFREE))
+                e |= PTE_COW;
+            else
+                e = (e & ~PTE_COW) | PTE_WRITE;
+        } else {
+            e &= ~PTE_COW;
+        }
+        *pte = e;
+        if (read_cr3_phys() == as->pml4_phys)
+            invlpg(virt);
+    }
+    spin_unlock_irqrestore(&lock, irq);
+    return ok;
+}
+
+bool vmm_grow_stack(struct address_space *as, uint64_t addr)
+{
+    if (!as || addr < as->stack_low || addr >= as->stack_top)
+        return false;
+    uint64_t v = ALIGN_DOWN(addr, PAGE_SIZE);
+    if (vmm_translate_user(as, v, NULL))
+        return false;
+    uint64_t p = pmm_alloc_zeroed();
+    if (!p)
+        return false;
+    if (!vmm_map_user(as, v, p, PTE_WRITE | PTE_NX)) {
+        pmm_free(p);
+        return false;
+    }
+    return true;
+}
+
+void vmm_unmap_user(struct address_space *as, uint64_t virt)
+{
+    uint64_t irq = spin_lock_irqsave(&lock);
+    uint64_t *pte = pte_of(as->pml4, virt);
+    if (pte) {
+        *pte = 0;
+        if (read_cr3_phys() == as->pml4_phys)
+            invlpg(virt);
+    }
+    spin_unlock_irqrestore(&lock, irq);
+}
+
 bool vmm_translate_user(struct address_space *as, uint64_t virt, uint64_t *phys)
 {
     return virt < USER_LIMIT && walk(as->pml4, virt, phys) != 0;
@@ -357,6 +437,8 @@ bool vmm_user_range_ok(struct address_space *as, uint64_t addr, size_t len, bool
         return false;
     for (uint64_t p = ALIGN_DOWN(addr, PAGE_SIZE); p < addr + len; p += PAGE_SIZE) {
         uint64_t e = walk(as->pml4, p, NULL);
+        if (!(e & PTE_PRESENT) && vmm_grow_stack(as, p))
+            e = walk(as->pml4, p, NULL);
         if (!(e & PTE_USER))
             return false;
         if (write && !(e & PTE_WRITE) && !vmm_cow_fault(as, p))
@@ -379,6 +461,10 @@ static bool clone_table(uint64_t *src, uint64_t *dst, int level)
         if (!(e & PTE_PRESENT))
             continue;
         if (level == 1) {
+            if (e & PTE_NOFREE) {
+                dst[i] = e;    // device memory stays shared and writable
+                continue;
+            }
             if (e & (PTE_WRITE | PTE_COW)) {
                 e = (e & ~PTE_WRITE) | PTE_COW;
                 src[i] = e;
@@ -403,6 +489,11 @@ struct address_space *vmm_clone_space(struct address_space *src)
     if (!as)
         return NULL;
     as->heap_top = src->heap_top;
+    as->brk_start = src->brk_start;
+    as->brk = src->brk;
+    as->mmap_next = src->mmap_next;
+    as->stack_low = src->stack_low;
+    as->stack_top = src->stack_top;
 
     uint64_t irq = spin_lock_irqsave(&lock);
     bool ok = true;

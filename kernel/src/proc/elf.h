@@ -5,8 +5,12 @@
 #define ELFCLASS64    2
 #define ELFDATA2LSB   1
 #define ET_EXEC       2
+#define ET_DYN        3
 #define EM_X86_64     62
 #define PT_LOAD       1
+#define PT_INTERP     3
+#define PT_NOTE       4
+#define PT_PHDR       6
 #define PF_X          1
 #define PF_W          2
 

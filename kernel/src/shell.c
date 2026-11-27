@@ -243,9 +243,11 @@ static void cmd_run(int argc, char **argv)
         kprintf("[%lu] %s\n", id, argv[1]);
         return;
     }
-    tty_set_fg(id);
+    console_tty.fg = id;
+    tty_console_route(true);
     int code = thread_join(t);
-    tty_set_fg(0);
+    tty_console_route(false);
+    console_tty.fg = 0;
     if (code)
         kprintf("%s exited with %d\n", argv[1], code);
 }

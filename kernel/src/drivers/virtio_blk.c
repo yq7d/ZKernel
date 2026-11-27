@@ -205,6 +205,7 @@ static bool setup(const struct pci_dev *pd)
     v->blk.write = vwrite;
     v->blk.priv = v;
     blk_register(&v->blk);
+    blk_scan_partitions(&v->blk);
     pr_ok("virtio-blk: /dev/%s, %lu MiB%s\n", v->blk.name, cap * SECTOR_SIZE >> 20,
           v->read_only ? ", read only" : "");
     return true;

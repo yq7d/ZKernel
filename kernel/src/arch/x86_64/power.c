@@ -1,5 +1,6 @@
 #include "arch/x86_64/power.h"
 #include "arch/x86_64/cpu.h"
+#include "arch/x86_64/acpi.h"
 #include "arch/x86_64/io.h"
 #include "drivers/ps2.h"
 #include "fs/vfs.h"
@@ -9,6 +10,7 @@ void machine_reboot(void)
 {
     vfs_sync();
     kprintf("rebooting...\n");
+    acpi_reset();
     ps2_reboot();
 
     // controller didn't do it, triple fault instead
@@ -22,7 +24,8 @@ void machine_poweroff(void)
     vfs_sync();
     kprintf("powering off...\n");
     cli();
-    // acpi pm1a control on qemu q35, then i440fx, then bochs/old qemu
+    acpi_poweroff();
+    // qemu's fixed ports, for when acpi couldn't be read: q35, i440fx, bochs
     outw(0x604, 0x2000);
     outw(0xB004, 0x2000);
     outw(0x4004, 0x3400);

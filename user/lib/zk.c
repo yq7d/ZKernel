@@ -82,7 +82,7 @@ int getcwd(char *buf, size_t size) { return (int)syscall3(SYS_GETCWD, (long)buf,
 int pipe(int fds[2]) { return (int)syscall3(SYS_PIPE, (long)fds, 0, 0); }
 int dup(int fd) { return (int)syscall3(SYS_DUP, fd, 0, 0); }
 int kill(long pid) { return (int)syscall3(SYS_KILL, pid, 0, 0); }
-void tty_setfg(long pgid) { syscall3(SYS_TTY_SETFG, pgid, 0, 0); }
+void tty_setfg(long pgid) { ioctl(0, TIOCSFG, (uint64_t)pgid); }
 int ps(struct zk_procinfo *out, size_t max) { return (int)syscall3(SYS_PS, (long)out, (long)max, 0); }
 
 long spawn(const char *path, char **argv, const struct zk_spawn *opts)
@@ -109,13 +109,29 @@ int execv(const char *path, char **argv)
 
 int rename(const char *from, const char *to) { return (int)syscall3(SYS_RENAME, (long)from, (long)to, 0); }
 long time(void) { return syscall3(SYS_TIME, 0, 0, 0); }
-int mount(const char *src, const char *target, const char *fstype)
+int mount(const char *src, const char *target, const char *fstype, const char *opts)
 {
-    return (int)syscall3(SYS_MOUNT, (long)src, (long)target, (long)fstype);
+    return (int)syscall4(SYS_MOUNT, (long)src, (long)target, (long)fstype, (long)opts);
 }
 int umount(const char *target) { return (int)syscall3(SYS_UMOUNT, (long)target, 0, 0); }
 void sync(void) { syscall3(SYS_SYNC, 0, 0, 0); }
 int statfs(const char *path, struct zk_statfs *st) { return (int)syscall3(SYS_STATFS, (long)path, (long)st, 0); }
+int ioctl(int fd, unsigned long req, uint64_t arg) { return (int)syscall3(SYS_IOCTL, fd, (long)req, (long)arg); }
+int poll(struct zk_pollfd *fds, size_t n, long timeout_ms) { return (int)syscall3(SYS_POLL, (long)fds, (long)n, timeout_ms); }
+int getcred(struct zk_cred *c) { return (int)syscall3(SYS_GETCRED, (long)c, 0, 0); }
+uint32_t getuid(void) { struct zk_cred c; getcred(&c); return c.uid; }
+uint32_t geteuid(void) { struct zk_cred c; getcred(&c); return c.euid; }
+uint32_t getgid(void) { struct zk_cred c; getcred(&c); return c.gid; }
+int setuid(uint32_t uid) { return (int)syscall3(SYS_SETUID, uid, 0, 0); }
+int setgid(uint32_t gid) { return (int)syscall3(SYS_SETGID, gid, 0, 0); }
+int setgroups(size_t n, const uint32_t *groups) { return (int)syscall3(SYS_SETGROUPS, (long)n, (long)groups, 0); }
+int chmod(const char *path, uint32_t mode) { return (int)syscall3(SYS_CHMOD, (long)path, mode, 0); }
+int chown(const char *path, uint32_t uid, uint32_t gid) { return (int)syscall3(SYS_CHOWN, (long)path, uid, gid); }
+int symlink(const char *target, const char *path) { return (int)syscall3(SYS_SYMLINK, (long)target, (long)path, 0); }
+long readlink(const char *path, char *buf, size_t size) { return syscall3(SYS_READLINK, (long)path, (long)buf, (long)size); }
+int lstat(const char *path, struct zk_stat *st) { return (int)syscall3(SYS_LSTAT, (long)path, (long)st, 0); }
+long getrandom(void *buf, size_t len) { return syscall3(SYS_GETRANDOM, (long)buf, (long)len, 0); }
+int openpty(int fds[2]) { return (int)syscall3(SYS_OPENPTY, (long)fds, 0, 0); }
 int reboot(int how) { return (int)syscall3(SYS_REBOOT, how, 0, 0); }
 int ftruncate(int fd, uint64_t size) { return (int)syscall3(SYS_FTRUNCATE, fd, (long)size, 0); }
 
@@ -135,7 +151,7 @@ const char *strerror(int err)
         "no such process", "file too big", "not permitted",
         "argument list too long", "busy", "cross-device link",
         "no space left on device", "i/o error", "read-only file system",
-        "no such device",
+        "no such device", "permission denied",
     };
     if (err > 0 || -err > ZK_ERRNO_MAX)
         return "unknown error";

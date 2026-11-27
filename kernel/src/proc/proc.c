@@ -6,16 +6,29 @@
 #include "drivers/pit.h"
 #include "drivers/tty.h"
 #include "fs/vfs.h"
+#include "lib/random.h"
 #include "lib/string.h"
+#include "proc/linux.h"
 #include "mm/heap.h"
 #include "mm/mm.h"
 #include "mm/pmm.h"
 #include "mm/vmm.h"
 #include "sched/sched.h"
 
+// user space layout
+//   0000000000400000  fixed address executables
+//   0000100000000000  heap from alloc_pages, growing up
+//   0000555555554000  position independent executables
+//   00007f0000000000  mmap, growing down
+//   00007fc000000000  the dynamic loader
+//   00007ffffff00000  top of the stack, which grows down on faults
 #define USER_STACK_TOP   0x00007ffffff00000UL
 #define USER_STACK_PAGES 16
+#define USER_STACK_MAX   (8UL << 20)
 #define USER_HEAP_BASE   0x0000100000000000UL
+#define PIE_BASE         0x0000555555554000UL
+#define USER_MMAP_TOP    0x00007f0000000000UL
+#define INTERP_BASE      0x00007fc000000000UL
 #define USER_MIN_ADDR    0x10000UL    // keep null pointer derefs faulting
 
 extern void enter_user(uint64_t entry, uint64_t rsp, uint64_t argc, uint64_t argv,
@@ -27,6 +40,9 @@ struct user_start {
 };
 
 char *proc_default_env[] = { "PATH=/bin", "HOME=/", "SHELL=/bin/sh", "TERM=zkernel", NULL };
+
+// kernel threads and whatever the kernel starts directly
+static const struct zk_cred root_cred;
 
 // every live or unreaped process, interrupts off to touch it
 static struct proc *procs;
@@ -50,11 +66,18 @@ static bool copy_to_user(struct address_space *as, uint64_t dst, const void *src
     return true;
 }
 
+// segments sharing a page get the union of their permissions
 static bool map_zeroed(struct address_space *as, uint64_t start, uint64_t end, uint64_t flags)
 {
     for (uint64_t v = ALIGN_DOWN(start, PAGE_SIZE); v < end; v += PAGE_SIZE) {
-        if (vmm_translate_user(as, v, NULL))
-            continue;    // segments can share a page
+        uint64_t phys;
+        if (vmm_translate_user(as, v, &phys)) {
+            if (flags & PTE_WRITE)
+                vmm_protect_user(as, v, PTE_WRITE | (flags & PTE_NX));
+            else if (!(flags & PTE_NX))
+                vmm_protect_user(as, v, 0);
+            continue;
+        }
         uint64_t p = pmm_alloc_zeroed();
         if (!p)
             return false;
@@ -66,24 +89,68 @@ static bool map_zeroed(struct address_space *as, uint64_t start, uint64_t end, u
     return true;
 }
 
-static int load_elf(struct address_space *as, const uint8_t *data, size_t size, uint64_t *entry)
+struct elf_info {
+    uint64_t entry;
+    uint64_t base;       // load bias, 0 for fixed address executables
+    uint64_t phdr, phnum;
+    uint64_t end;        // highest address used
+    bool native;         // carries the ZOS note
+    char interp[ZK_PATH_MAX];
+};
+
+#define NOTE_ZOS 0x534f5a    // "ZOS"
+
+static bool has_zos_note(const uint8_t *data, size_t size, const struct elf64_phdr *p)
+{
+    if (p->offset > size || p->filesz > size - p->offset)
+        return false;
+    const uint8_t *n = data + p->offset, *end = n + p->filesz;
+    while (n + 12 <= end) {
+        uint32_t namesz = *(const uint32_t *)n, descsz = *(const uint32_t *)(n + 4);
+        const uint8_t *name = n + 12;
+        if (name + namesz > end)
+            break;
+        if (namesz == 4 && memcmp(name, "ZOS", 4) == 0)
+            return true;
+        n = name + ALIGN_UP(namesz, 4) + ALIGN_UP(descsz, 4);
+    }
+    return false;
+}
+
+static int load_elf(struct address_space *as, const uint8_t *data, size_t size,
+                    uint64_t base, struct elf_info *info)
 {
     const struct elf64_ehdr *eh = (const void *)data;
     if (size < sizeof(*eh) || eh->magic != ELF_MAGIC || eh->class != ELFCLASS64 ||
-        eh->data != ELFDATA2LSB || eh->type != ET_EXEC || eh->machine != EM_X86_64 ||
+        eh->data != ELFDATA2LSB || eh->machine != EM_X86_64 ||
+        (eh->type != ET_EXEC && eh->type != ET_DYN) ||
         eh->phentsize != sizeof(struct elf64_phdr) ||
         eh->phoff > size || eh->phnum > (size - eh->phoff) / sizeof(struct elf64_phdr))
         return ZK_ENOEXEC;
+    if (eh->type == ET_EXEC)
+        base = 0;
 
+    memset(info, 0, sizeof(*info));
+    info->base = base;
+    info->phnum = eh->phnum;
     const struct elf64_phdr *ph = (const void *)(data + eh->phoff);
     for (int i = 0; i < eh->phnum; i++) {
         const struct elf64_phdr *p = &ph[i];
+        if (p->type == PT_INTERP && p->filesz < sizeof info->interp &&
+            p->offset < size && p->filesz <= size - p->offset) {
+            memcpy(info->interp, data + p->offset, p->filesz);
+            info->interp[p->filesz] = '\0';
+        }
+        if (p->type == PT_NOTE && has_zos_note(data, size, p))
+            info->native = true;
+        if (p->type == PT_PHDR)
+            info->phdr = base + p->vaddr;
         if (p->type != PT_LOAD || p->memsz == 0)
             continue;
 
-        uint64_t end = p->vaddr + p->memsz;
-        if (p->filesz > p->memsz || end < p->vaddr || p->vaddr < USER_MIN_ADDR ||
-            end > USER_HEAP_BASE || p->offset > size || p->filesz > size - p->offset)
+        uint64_t start = base + p->vaddr, end = start + p->memsz;
+        if (p->filesz > p->memsz || end < start || start < USER_MIN_ADDR ||
+            end > USER_STACK_TOP - USER_STACK_MAX || p->offset > size || p->filesz > size - p->offset)
             return ZK_ENOEXEC;
 
         uint64_t flags = 0;
@@ -92,13 +159,18 @@ static int load_elf(struct address_space *as, const uint8_t *data, size_t size, 
         if (!(p->flags & PF_X))
             flags |= PTE_NX;
 
-        if (!map_zeroed(as, p->vaddr, end, flags) ||
-            !copy_to_user(as, p->vaddr, data + p->offset, p->filesz))
+        if (!map_zeroed(as, start, end, flags) ||
+            !copy_to_user(as, start, data + p->offset, p->filesz))
             return ZK_ENOMEM;
+        if (end > info->end)
+            info->end = end;
+        // the headers are usually inside the first segment
+        if (!info->phdr && eh->phoff >= p->offset && eh->phoff < p->offset + p->filesz)
+            info->phdr = start + (eh->phoff - p->offset);
     }
 
-    *entry = eh->entry;
-    if (*entry < USER_MIN_ADDR || *entry >= USER_HEAP_BASE)
+    info->entry = base + eh->entry;
+    if (info->entry < USER_MIN_ADDR || info->entry >= info->end || !info->end)
         return ZK_ENOEXEC;
     return 0;
 }
@@ -130,13 +202,35 @@ static int count_strv(char **v, int max)
     return n;
 }
 
-// strings at the top of the stack, then argv[] and envp[] below them
+#define AT_NULL   0
+#define AT_PHDR   3
+#define AT_PHENT  4
+#define AT_PHNUM  5
+#define AT_PAGESZ 6
+#define AT_BASE   7
+#define AT_ENTRY  9
+#define AT_UID    11
+#define AT_EUID   12
+#define AT_GID    13
+#define AT_EGID   14
+#define AT_HWCAP  16
+#define AT_CLKTCK 17
+#define AT_SECURE 23
+#define AT_RANDOM 25
+#define AT_EXECFN 31
+
+// the standard layout: strings at the top, then argc, argv[], envp[] and the
+// aux vector from rsp upwards. ZOS programs also get argc/argv/envp in registers
 static int setup_stack(struct address_space *as, char **argv, char **envp,
-                       struct user_start *s)
+                       const char *path, const struct elf_info *prog,
+                       uint64_t interp_base, const struct zk_cred *cred, struct user_start *s)
 {
-    uint64_t bottom = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
-    if (!map_zeroed(as, bottom, USER_STACK_TOP, PTE_WRITE | PTE_NX))
+    uint64_t initial = USER_STACK_TOP - USER_STACK_PAGES * PAGE_SIZE;
+    if (!map_zeroed(as, initial, USER_STACK_TOP, PTE_WRITE | PTE_NX))
         return ZK_ENOMEM;
+    as->stack_top = USER_STACK_TOP;
+    as->stack_low = USER_STACK_TOP - USER_STACK_MAX;
+
     int argc = count_strv(argv, PROC_MAX_ARGS);
     int envc = count_strv(envp, PROC_MAX_ENV);
     if (argc < 0 || envc < 0)
@@ -151,28 +245,75 @@ static int setup_stack(struct address_space *as, char **argv, char **envp,
     if (err)
         return err;
 
-    sp = ALIGN_DOWN(sp, 16);
-    sp -= (uint64_t)(argc + 1 + envc + 1) * sizeof(uint64_t);
-    sp = ALIGN_DOWN(sp, 16);
-    uint64_t uargv = sp, uenvp = sp + (uint64_t)(argc + 1) * sizeof(uint64_t);
-    if (!copy_to_user(as, uargv, aptrs, (size_t)(argc + 1) * sizeof(uint64_t)) ||
-        !copy_to_user(as, uenvp, eptrs, (size_t)(envc + 1) * sizeof(uint64_t)))
+    size_t plen = strlen(path) + 1;
+    sp -= plen;
+    uint64_t execfn = sp;
+    if (!copy_to_user(as, sp, path, plen))
+        return ZK_EFAULT;
+    uint8_t rnd[16];
+    random_bytes(rnd, sizeof rnd);
+    sp = ALIGN_DOWN(sp, 16) - 16;
+    uint64_t random_at = sp;
+    if (!copy_to_user(as, sp, rnd, sizeof rnd))
         return ZK_EFAULT;
 
-    s->argc = (uint64_t)argc;
-    s->argv = uargv;
-    s->envp = uenvp;
-    s->rsp = sp;    // 16 byte aligned, _start calls main from here
+    uint64_t aux[] = {
+        AT_PHDR, prog->phdr, AT_PHENT, sizeof(struct elf64_phdr), AT_PHNUM, prog->phnum,
+        AT_PAGESZ, PAGE_SIZE, AT_BASE, interp_base, AT_ENTRY, prog->entry,
+        AT_UID, cred->uid, AT_EUID, cred->euid, AT_GID, cred->gid, AT_EGID, cred->egid,
+        AT_SECURE, cred->uid != cred->euid || cred->gid != cred->egid,
+        AT_HWCAP, 0, AT_CLKTCK, 100, AT_RANDOM, random_at, AT_EXECFN, execfn,
+        AT_NULL, 0,
+    };
+    size_t words = 1 + (size_t)(argc + 1) + (size_t)(envc + 1) + sizeof aux / 8;
+    sp -= words * 8;
+    sp = ALIGN_DOWN(sp, 16);
+    uint64_t at = sp;
+    uint64_t argc64 = (uint64_t)argc;
+    if (!copy_to_user(as, at, &argc64, 8) ||
+        !copy_to_user(as, at + 8, aptrs, (size_t)(argc + 1) * 8) ||
+        !copy_to_user(as, at + 8 + (uint64_t)(argc + 1) * 8, eptrs, (size_t)(envc + 1) * 8) ||
+        !copy_to_user(as, at + 8 + (uint64_t)(argc + envc + 2) * 8, aux, sizeof aux))
+        return ZK_EFAULT;
+
+    s->argc = argc64;
+    s->argv = at + 8;
+    s->envp = at + 8 + (uint64_t)(argc + 1) * 8;
+    s->rsp = at;
     return 0;
 }
 
-// new address space with the program loaded and its stack set up
+// path to the file, through /compat/linux for linux programs
+static int read_exec(const char *path, struct zk_stat *st, void **data, size_t *size)
+{
+    struct vnode *v;
+    int err = vfs_lookup(path, &v);
+    if (err)
+        return err;
+    if (v->type == VNODE_DIR)
+        err = ZK_EISDIR;
+    else if (v->type != VNODE_FILE)
+        err = ZK_EACCES;
+    else
+        err = vfs_permission(v, MAY_EXEC);
+    st->uid = v->uid;
+    st->gid = v->gid;
+    st->mode = v->mode;
+    vnode_put(v);
+    if (err)
+        return err;
+    return vfs_read_all(path, data, size, PROC_MAX_EXEC);
+}
+
+// new address space with the program (and its interpreter) loaded and the
+// stack set up. *abi says what kind of program it is
 static int build_image(const char *path, char **argv, char **envp,
-                       struct address_space **as_out, struct user_start *s)
+                       const struct zk_cred *cred, struct address_space **as_out,
+                       struct user_start *s, struct zk_stat *st, int *abi)
 {
     void *data;
     size_t size;
-    int err = vfs_read_all(path, &data, &size, PROC_MAX_EXEC);
+    int err = read_exec(path, st, &data, &size);
     if (err)
         return err;
 
@@ -182,14 +323,47 @@ static int build_image(const char *path, char **argv, char **envp,
         return ZK_ENOMEM;
     }
     as->heap_top = USER_HEAP_BASE;
-    err = load_elf(as, data, size, &s->entry);
+    as->mmap_next = USER_MMAP_TOP;
+
+    struct elf_info prog, interp;
+    uint64_t interp_base = 0, entry;
+    err = load_elf(as, data, size, PIE_BASE, &prog);
     kfree(data);
-    if (!err)
-        err = setup_stack(as, argv, envp, s);
+    *abi = prog.native ? ABI_ZOS : ABI_LINUX;
+    entry = prog.entry;
+
+    if (!err && prog.interp[0]) {
+        // the dynamic loader lives in the linux tree
+        char ipath[ZK_PATH_MAX];
+        linux_resolve(prog.interp, ipath, false);
+        struct zk_stat ist;
+        err = read_exec(ipath, &ist, &data, &size);
+        if (!err) {
+            err = load_elf(as, data, size, INTERP_BASE, &interp);
+            kfree(data);
+            interp_base = INTERP_BASE;
+            entry = interp.entry;
+        }
+        *abi = ABI_LINUX;
+    }
+    if (!err) {
+        as->brk_start = as->brk = ALIGN_UP(prog.end, PAGE_SIZE);
+        struct zk_cred c = *cred;
+        if (st->mode & ZK_S_ISUID)
+            c.euid = st->uid;
+        if (st->mode & ZK_S_ISGID)
+            c.egid = st->gid;
+        err = setup_stack(as, argv, envp, path, &prog, interp_base, &c, s);
+    }
     if (err) {
         vmm_destroy_space(as);
         return err;
     }
+    s->entry = entry;
+    // linux's _start reads everything off the stack, and takes rdx as a
+    // function to run at exit, so registers have to be zero for it
+    if (*abi == ABI_LINUX)
+        s->argc = s->argv = s->envp = 0;
     *as_out = as;
     return 0;
 }
@@ -217,6 +391,15 @@ static const char *base_name(const char *path)
     return name ? name + 1 : path;
 }
 
+// set-user-id and set-group-id programs run as the file's owner
+static void apply_setid(struct zk_cred *c, const struct zk_stat *st)
+{
+    if (st->mode & ZK_S_ISUID)
+        c->euid = c->suid = st->uid;
+    if (st->mode & ZK_S_ISGID)
+        c->egid = c->sgid = st->gid;
+}
+
 // starts p's thread and makes it visible. fpu NULL gives a clean fpu state
 static struct thread *start_proc(struct proc *p, const char *name, thread_fn fn, void *arg,
                                  bool joinable, struct address_space *as, uint64_t pgid,
@@ -231,8 +414,10 @@ static struct thread *start_proc(struct proc *p, const char *name, thread_fn fn,
         p->pgid = pgid ? pgid : p->pid;
         p->list_next = procs;
         procs = p;
-        if (copy_fpu)
+        if (copy_fpu) {
             fpu_save(t->fpu);    // the caller's user state, the kernel never touches it
+            t->fs_base = thread_current()->fs_base;
+        }
     }
     irq_restore(flags);
     return t;
@@ -248,11 +433,24 @@ struct thread *proc_spawn(const char *path, char **argv, char **envp,
     struct user_start *s = kzalloc(sizeof(*s));
     struct proc *p = kzalloc(sizeof(*p));
     struct address_space *as = NULL;
+    struct zk_stat st;
+    int abi = ABI_ZOS;
+    p->cred = o->parent ? o->parent->cred : root_cred;
     *err = ZK_ENOMEM;
     if (s && p)
-        *err = build_image(path, argv, envp, &as, s);
+        *err = build_image(path, argv, envp, &p->cred, &as, s, &st, &abi);
     if (*err)
         goto fail;
+    apply_setid(&p->cred, &st);
+    p->abi = abi;
+    strlcpy(p->exe, path, sizeof p->exe);
+    // the terminal on stdin becomes the controlling one, else the parent's
+    if (o->std[0] && tty_of(o->std[0]->v))
+        p->ctty = o->std[0]->v;
+    else if (o->parent)
+        p->ctty = o->parent->ctty;
+    if (p->ctty)
+        vnode_get(p->ctty);
 
     const char *cwd = o->cwd ? o->cwd : o->parent ? o->parent->cwd : "/";
     strlcpy(p->cwd, cwd, sizeof p->cwd);
@@ -286,7 +484,7 @@ static void fork_child(void *arg)
     return_to_user(&f);
 }
 
-int64_t proc_fork(struct interrupt_frame *frame)
+int64_t proc_fork(struct interrupt_frame *frame, uint64_t new_rsp, uint64_t child_tid)
 {
     struct proc *me = proc_current();
     struct thread *cur = thread_current();
@@ -300,9 +498,23 @@ int64_t proc_fork(struct interrupt_frame *frame)
     }
     *f = *frame;
     f->rax = 0;    // fork returns 0 in the child
+    if (new_rsp)
+        f->rsp = new_rsp;
+    as->brk_start = cur->as->brk_start;
+    as->brk = cur->as->brk;
+    as->mmap_next = cur->as->mmap_next;
+    as->stack_low = cur->as->stack_low;
+    as->stack_top = cur->as->stack_top;
 
     strlcpy(p->cwd, me->cwd, sizeof p->cwd);
+    strlcpy(p->exe, me->exe, sizeof p->exe);
     p->parent = me;
+    p->cred = me->cred;
+    p->abi = me->abi;
+    p->cloexec = me->cloexec;
+    p->ctty = me->ctty;
+    if (p->ctty)
+        vnode_get(p->ctty);
     for (int i = 0; i < PROC_MAX_FDS; i++) {
         if (me->fds[i]) {
             file_get(me->fds[i]);
@@ -310,7 +522,17 @@ int64_t proc_fork(struct interrupt_frame *frame)
         }
     }
 
+    // the child's tid goes into its memory before it can run
+    uint64_t flags = irq_save();
     struct thread *t = start_proc(p, cur->name, fork_child, f, true, as, me->pgid, true);
+    if (t && child_tid && vmm_user_range_ok(as, child_tid, 4, true)) {
+        uint64_t phys;
+        uint32_t tid = (uint32_t)t->id;
+        vmm_cow_fault(as, child_tid);
+        if (vmm_translate_user(as, child_tid, &phys) && (child_tid & (PAGE_SIZE - 1)) <= PAGE_SIZE - 4)
+            memcpy(phys_to_virt(phys), &tid, 4);
+    }
+    irq_restore(flags);
     if (!t) {
         close_fds(p);
         kfree(p);
@@ -326,9 +548,25 @@ int proc_exec(const char *path, char **argv, char **envp, void *release)
     struct thread *t = thread_current();
     struct user_start s;
     struct address_space *as;
-    int err = build_image(path, argv, envp, &as, &s);
+    struct zk_stat st;
+    struct proc *me = proc_current();
+    int abi;
+    int err = build_image(path, argv, envp, &me->cred, &as, &s, &st, &abi);
     if (err)
         return err;
+    apply_setid(&me->cred, &st);
+    me->abi = abi;
+    strlcpy(me->exe, path, sizeof me->exe);
+    // close on exec
+    for (int i = 0; i < PROC_MAX_FDS; i++) {
+        if (me->fds[i] && (me->cloexec & (1U << i))) {
+            file_put(me->fds[i]);
+            me->fds[i] = NULL;
+        }
+    }
+    me->cloexec = 0;
+    t->fs_base = 0;
+    wrmsr(MSR_FS_BASE, 0);
 
     // past this point there's no going back
     uint64_t flags = irq_save();
@@ -362,6 +600,22 @@ void proc_put_console(struct spawn_opts *o)
 struct proc *proc_current(void)
 {
     return thread_current()->proc;
+}
+
+const struct zk_cred *cred_current(void)
+{
+    struct proc *p = proc_current();
+    return p ? &p->cred : &root_cred;
+}
+
+bool cred_in_group(const struct zk_cred *c, uint32_t gid)
+{
+    if (c->egid == gid)
+        return true;
+    for (uint32_t i = 0; i < c->ngroups && i < ZK_NGROUPS; i++)
+        if (c->groups[i] == gid)
+            return true;
+    return false;
 }
 
 bool proc_killed(void)
@@ -483,6 +737,8 @@ void proc_free(struct proc *p)
     }
     irq_restore(flags);
     close_fds(p);    // only a proc that never ran still has some
+    if (p->ctty)
+        vnode_put(p->ctty);
     kfree(p);
 }
 
@@ -515,7 +771,7 @@ int proc_snapshot(struct zk_procinfo *out, int max)
         i->pgid = p->pgid;
         i->cpu_ms = p->thread->cpu_ticks * 1000 / TIMER_HZ;
         i->state = p->thread->state;
-        i->pad = 0;
+        i->uid = p->cred.uid;
         strlcpy(i->name, p->thread->name, sizeof i->name);
     }
     irq_restore(flags);
@@ -552,6 +808,19 @@ const char *proc_strerror(int err)
         [-ZK_EIO] = "i/o error",
         [-ZK_EROFS] = "read-only file system",
         [-ZK_ENODEV] = "no such device",
+        [-ZK_EACCES] = "permission denied",
+        [-ZK_ELOOP] = "too many symlinks",
+        [-ZK_ENOTTY] = "not a terminal",
+        [-ZK_EAGAIN] = "try again",
+        [-ZK_ENOTSOCK] = "not a socket",
+        [-ZK_ECONNREFUSED] = "connection refused",
+        [-ZK_ETIMEDOUT] = "timed out",
+        [-ZK_ENETUNREACH] = "network unreachable",
+        [-ZK_EADDRINUSE] = "address in use",
+        [-ZK_ENOTCONN] = "not connected",
+        [-ZK_ECONNRESET] = "connection reset",
+        [-ZK_EHOSTUNREACH] = "host unreachable",
+        [-ZK_EINPROGRESS] = "in progress",
     };
     if (err > 0 || -err > ZK_ERRNO_MAX)
         return "unknown error";

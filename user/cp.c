@@ -31,6 +31,9 @@ static int copy_file(const char *src, const char *dst)
         dprintf(2, "cp: %s: %s\n", src, strerror((int)n));
         rc = 1;
     }
+    struct zk_stat st;
+    if (fstat(in, &st) == 0)
+        chmod(dst, st.mode & 0777);
     close(in);
     close(out);
     return rc;

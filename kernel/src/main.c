@@ -3,6 +3,7 @@
 #include <limine.h>
 #include <zk/version.h>
 
+#include "arch/x86_64/acpi.h"
 #include "arch/x86_64/fpu.h"
 #include "arch/x86_64/gdt.h"
 #include "arch/x86_64/interrupts.h"
@@ -10,9 +11,12 @@
 #include "arch/x86_64/pic.h"
 #include "cmdline.h"
 #include "console/console.h"
+#include "drivers/ahci.h"
 #include "drivers/blk.h"
+#include "drivers/nvme.h"
 #include "drivers/fb.h"
 #include "drivers/keyboard.h"
+#include "drivers/mouse.h"
 #include "drivers/pci.h"
 #include "drivers/pit.h"
 #include "drivers/virtio_blk.h"
@@ -26,6 +30,8 @@
 #include "kprintf.h"
 #include "drivers/tty.h"
 #include "lib/string.h"
+#include "net/net.h"
+#include "proc/linux.h"
 #include "proc/proc.h"
 #include "sched/sched.h"
 #include "shell.h"
@@ -70,6 +76,12 @@ static volatile struct limine_module_request module_request = {
     .revision = 0,
 };
 
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_rsdp_request rsdp_request = {
+    .id = LIMINE_RSDP_REQUEST_ID,
+    .revision = 0,
+};
+
 __attribute__((used, section(".limine_requests_start")))
 static volatile uint64_t requests_start[] = LIMINE_REQUESTS_START_MARKER;
 
@@ -83,6 +95,7 @@ extern void switch_stack(uint64_t top, void (*fn)(void)) __attribute__((noreturn
 static uint64_t boot_stack;
 
 // module memory isn't reclaimed, but the limine structs describing it are
+static uint64_t rsdp_phys;
 static const void *initrd_data;
 static size_t initrd_size;
 
@@ -104,10 +117,11 @@ static void find_initrd(void)
 // runs /bin/sh (or init=) on the console, falling back to the kernel shell
 static void run_init(void)
 {
-    char init[ZK_PATH_MAX] = "/bin/sh";
+    char init[ZK_PATH_MAX] = "/bin/init";
     cmdline_get("init", init, sizeof init);
     if (strcmp(init, "kshell") == 0)
         return;
+    tty_console_route(true);
 
     for (int failures = 0; failures < 3; ) {
         struct spawn_opts o;
@@ -119,15 +133,17 @@ static void run_init(void)
         proc_put_console(&o);
         if (!t) {
             pr_err("init: can't run %s: %s\n", init, proc_strerror(err));
+            tty_console_route(false);
             return;
         }
         int code = thread_join(t);
-        tty_set_fg(0);
+        console_tty.fg = 0;
         pr_warn("init: %s exited with %d, restarting\n", init, code);
         // something is badly wrong if it keeps dying right away
         failures = timer_uptime_ms() - start < 1000 ? failures + 1 : 0;
     }
     pr_err("init: giving up\n");
+    tty_console_route(false);
 }
 
 static void banner(void)
@@ -160,11 +176,14 @@ static void kmain_late(void)
         pr_warn("initrd: no initrd.tar module\n");
     }
     syscall_init();
-    pr_ok("syscalls: int 0x80\n");
+    linux_init();
+    pr_ok("syscalls: int 0x80, plus the syscall instruction for linux programs\n");
 
+    acpi_init(rsdp_phys);
     pci_init();
     pr_ok("pci: %d devices\n", pci_count());
-    virtio_blk_init();
+
+    net_init();
 
     timer_init(TIMER_HZ);
     pr_ok("timer: pit at %d Hz\n", TIMER_HZ);
@@ -175,9 +194,19 @@ static void kmain_late(void)
         pr_ok("keyboard: ps/2 ready\n");
     else
         pr_warn("keyboard: no ps/2 controller found\n");
+    if (mouse_init())
+        pr_ok("mouse: ps/2 ready\n");
+    else
+        pr_warn("mouse: none found\n");
 
     __asm__ volatile ("sti");
     pr_ok("interrupts enabled\n");
+
+    // disk drivers wait on the timer, so they come after it
+    virtio_blk_init();
+    ahci_init();
+    nvme_init();
+    blk_start_flusher();
 
     pr_info("running self-tests...\n");
     bool ok = test_string() & test_printf() & test_mm() & test_timer() & test_sched() & test_vfs() & test_proc();
@@ -187,15 +216,6 @@ static void kmain_late(void)
     char fault[16];
     if (cmdline_get("fault", fault, sizeof fault))
         trigger_fault(fault);
-
-    // the first disk goes on /mnt if it holds a filesystem we know
-    if (blk_count() > 0) {
-        int err = vfs_mount("/dev/vda", "/mnt", "fat");
-        if (err)
-            pr_warn("mount: /dev/vda on /mnt: %s\n", proc_strerror(err));
-        else
-            pr_ok("mount: /dev/vda on /mnt (fat)\n");
-    }
 
     pr_ok("boot complete\n");
     run_init();
@@ -224,6 +244,7 @@ void kmain(void)
     pr_ok("framebuffer: %ux%u, pitch %u, at %p\n",
           fb.width, fb.height, fb.pitch, (void *)fb.addr);
     pr_ok("console: ready\n");
+    tty_console_init();
 
     cmdline_init(cmdline_request.response ? cmdline_request.response->cmdline : "");
     pr_info("command line: \"%s\"\n", cmdline_raw());
@@ -252,6 +273,13 @@ void kmain(void)
     heap_init();
     pr_ok("heap: ready at %p\n", (void *)HEAP_BASE);
     find_initrd();
+    // the response sits in memory that's about to be reclaimed
+    if (rsdp_request.response) {
+        // older protocol revisions hand out an hhdm address, newer a physical one
+        rsdp_phys = (uint64_t)rsdp_request.response->address;
+        if (rsdp_phys >= hhdm_offset)
+            rsdp_phys -= hhdm_offset;
+    }
 
     boot_stack = vmm_alloc_stack(KERNEL_STACK_PAGES);
     pr_ok("stack: %u KiB at %p with guard page\n", KERNEL_STACK_PAGES * 4, (void *)boot_stack);

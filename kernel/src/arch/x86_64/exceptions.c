@@ -83,6 +83,12 @@ void exception_handle(struct interrupt_frame *f)
         if (t && t->as && vmm_cow_fault(t->as, read_cr2()))
             return;
     }
+    // the user stack grows on demand
+    if (vec == 14 && !(f->error_code & 1)) {
+        struct thread *t = thread_current();
+        if (t && t->as && vmm_grow_stack(t->as, read_cr2()))
+            return;
+    }
 
     // #DB and #BP aren't fatal
     if (vec == 3 || vec == 1) {

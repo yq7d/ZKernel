@@ -1,0 +1,2 @@
+# runs once at boot as root, before anyone logs in
+mount -a

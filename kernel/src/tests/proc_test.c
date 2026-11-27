@@ -45,6 +45,8 @@ bool test_proc(void)
         file_write(f, "not an elf at all", 17);
         file_put(f);
     }
+    CHECK(proc_spawn("/tmp/junk", args, NULL, &o, &err) == NULL && err == ZK_EACCES);
+    vfs_chmod("/tmp/junk", 0755);
     CHECK(proc_spawn("/tmp/junk", args, NULL, &o, &err) == NULL && err == ZK_ENOEXEC);
     vfs_unlink("/tmp/junk");
     CHECK(pmm_free_count() == before);

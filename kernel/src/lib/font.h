@@ -1,5 +1,5 @@
 #pragma once
-// psf1/psf2 bitmap fonts
+// psf1/psf2 bitmap fonts. shared with user programs
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -16,6 +16,3 @@ struct font {
 bool font_load_psf(struct font *f, const void *data, size_t size);
 
 const uint8_t *font_glyph(const struct font *f, unsigned char c);
-
-// font.asm
-extern const uint8_t font_psf_start[], font_psf_end[];

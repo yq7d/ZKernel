@@ -1,2 +1,2 @@
-# run by interactive shells at startup
-export PATH=/bin:/mnt/bin
+# run by interactive shells at startup, before ~/.profile
+export PATH=/bin:/usr/local/bin:/compat/linux/bin:/compat/linux/usr/bin

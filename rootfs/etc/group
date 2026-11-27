@@ -1,0 +1,6 @@
+root:x:0:root
+disk:x:6:root
+wheel:x:10:zos
+input:x:20:zos
+video:x:21:zos
+zos:x:1000:

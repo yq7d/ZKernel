@@ -2,11 +2,12 @@
 # make run        boot in qemu (bios)
 # make run-uefi   boot in qemu (uefi)
 # make debug      boot paused, gdb on :1234
-# make disk       fresh 64 MiB fat32 disk image (wipes the old one)
+# make disk       fresh disk image (wipes the old one): 64 MiB fat, the rest ext2
 # make clean      everything but the disk image
 #
 # kernel cmdline: make run KCMDLINE="fault=pf"
-#   init=/bin/sh (default) or init=kshell for the built in kernel shell
+#   init=/bin/init (default, the desktop), init=/bin/sh for text only,
+#   init=kshell for the built in kernel shell
 
 BUILD   := build
 KCMDLINE ?=
@@ -44,22 +45,35 @@ USER_PROGS   := hello spin fault guess sh ls cat echo mkdir rm wc ps kill utest 
                 cp mv rmdir touch stat head tail grep sort uniq tee cut tr seq yes \
                 basename dirname hexdump cmp sleep true false dmesg lspci uname \
                 uptime free clear date df mount umount sync reboot poweroff which \
-                env pwd hostname du find xargs printf
+                env pwd hostname du find xargs printf init zwm \
+                id whoami sudo su passwd chmod chown ifconfig ping host fetch pkg zfetch \
+                mkfs.fat mkfs.ext2 zos-install
 USER_BINS    := $(USER_PROGS:%=$(BUILD)/user/%.elf)
 USER_LIB     := $(BUILD)/user/lib/crt0.asm.o $(BUILD)/user/lib/zk.o $(BUILD)/user/lib/malloc.o $(BUILD)/user/lib/env.o $(BUILD)/user/lib/util.o \
+                $(BUILD)/user/lib/sha256.o $(BUILD)/user/lib/users.o $(BUILD)/user/lib/net.o \
+                $(BUILD)/user/lib/inflate.o $(BUILD)/user/lib/fsprobe.o \
                 $(BUILD)/user/klib/printf.o $(BUILD)/user/klib/string.o \
-                $(BUILD)/user/klib/time.o
+                $(BUILD)/user/klib/time.o $(BUILD)/user/klib/font.o \
+                $(BUILD)/user/lib/gfx.o
 
 DISK := disk.img
 
 .PHONY: all run run-uefi debug clean disk FORCE
 all: $(ISO) $(DISK)
 
-# made once and kept, it's the persistent storage. mounted on /mnt
+# made once and kept, it's the persistent storage (see /etc/fstab):
+#   partition 1, fat32, /mnt. easy to reach from the host with mtools
+#   partition 2, ext2, /data. home, installed packages, /usr/local
+DISK_MB := 1024
+FAT_MB  := 64
 $(DISK):
-	dd if=/dev/zero of=$@ bs=1M count=64 status=none
-	mkfs.fat -F 32 -n ZKDISK $@ >/dev/null
-	printf 'this file lives on the fat32 disk image\n' | mcopy -i $@ - ::readme.txt
+	dd if=/dev/zero of=$@ bs=1M count=0 seek=$(DISK_MB) status=none
+	printf 'label: dos\nstart=2048, size=%d, type=c\nstart=%d, type=83\n' \
+	    $$(($(FAT_MB) * 2048)) $$(($(FAT_MB) * 2048 + 2048)) | sfdisk -q $@
+	mkfs.fat -F 32 -s 1 -n ZOSSHARE --offset 2048 $@ $$(($(FAT_MB) * 1024)) >/dev/null 2>&1
+	mke2fs -q -F -t ext2 -O ^dir_index -L ZOSDATA -E offset=$$(($(FAT_MB) * 1048576 + 1048576)) \
+	    $@ $$((($(DISK_MB) - $(FAT_MB) - 1) * 1024))k
+	printf 'this file lives on the fat32 partition\n' | mcopy -i $@@@1M - ::readme.txt
 
 disk:
 	rm -f $(DISK)
@@ -94,15 +108,41 @@ $(BUILD)/user/%.asm.o: user/%.asm
 $(BUILD)/user/%.elf: $(BUILD)/user/%.o $(USER_LIB) user/linker.ld
 	$(LD) $(USER_LDFLAGS) $(USER_LIB) $< -o $@
 
+# a static glibc program to test the linux layer with, built by the host's gcc
+LTEST := $(BUILD)/ltest
+$(LTEST): tests/linux/ltest.c
+	@mkdir -p $(BUILD)
+	gcc -static -O2 -o $@ $<
+	strip $@
+
 # rootfs/ plus the programs in /bin
 INITRD       := $(BUILD)/initrd.tar
 ROOTFS_FILES := $(shell find rootfs -type f 2>/dev/null)
 
-$(INITRD): $(USER_BINS) $(ROOTFS_FILES)
+$(INITRD): $(USER_BINS) $(ROOTFS_FILES) kernel/fonts/ter-v16n.psf $(LTEST) $(KERNEL)
 	rm -rf $(BUILD)/rootfs
 	mkdir -p $(BUILD)/rootfs/bin
 	[ -d rootfs ] && cp -r rootfs/. $(BUILD)/rootfs/ || true
 	for p in $(USER_PROGS); do strip -o $(BUILD)/rootfs/bin/$$p $(BUILD)/user/$$p.elf; done
+	mkdir -p $(BUILD)/rootfs/usr/share/fonts
+	cp kernel/fonts/ter-v16n.psf $(BUILD)/rootfs/usr/share/fonts/
+	# for testing the linux layer: make ALPINE_ROOT=/path/to/extracted/rootfs
+	if [ -n "$(ALPINE_ROOT)" ]; then mkdir -p $(BUILD)/rootfs/compat/linux && \
+	    cp -a $(ALPINE_ROOT)/. $(BUILD)/rootfs/compat/linux/; fi
+	mkdir -p $(BUILD)/rootfs/usr/lib/zos
+	cp $(LTEST) $(BUILD)/rootfs/usr/lib/zos/ltest
+	ln -sf zfetch $(BUILD)/rootfs/bin/neofetch
+	ln -sf zfetch $(BUILD)/rootfs/bin/fastfetch
+	chmod 4755 $(BUILD)/rootfs/bin/sudo $(BUILD)/rootfs/bin/su $(BUILD)/rootfs/bin/passwd
+	chmod 600 $(BUILD)/rootfs/etc/shadow
+	chmod 440 $(BUILD)/rootfs/etc/sudoers
+	# what an installed system boots: everything but the installer's payload
+	tar --format=ustar --owner=0 --group=0 -cf $(BUILD)/initrd-base.tar -C $(BUILD)/rootfs .
+	# the live system carries a copy of itself for zos-install
+	mkdir -p $(BUILD)/rootfs/usr/share/zos/install
+	cp $(KERNEL) $(BUILD)/rootfs/usr/share/zos/install/zkernel
+	cp $(BUILD)/initrd-base.tar $(BUILD)/rootfs/usr/share/zos/install/initrd.tar
+	cp $(LIMINE)/BOOTX64.EFI $(BUILD)/rootfs/usr/share/zos/install/
 	tar --format=ustar --owner=0 --group=0 -cf $@ -C $(BUILD)/rootfs .
 
 $(KERNEL): $(OBJS) kernel/linker.ld

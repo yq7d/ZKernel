@@ -115,6 +115,32 @@ bool ps2_init(void)
     return write_config((uint8_t)cfg);
 }
 
+#define CMD_ENABLE_P2    0xA8
+#define CMD_WRITE_P2     0xD4
+#define CFG_P2_CLOCK_OFF 0x20
+
+static bool mouse_cmd(uint8_t c)
+{
+    if (!send_cmd(CMD_WRITE_P2) || !send_data(c))
+        return false;
+    return read_data() == DEV_ACK;
+}
+
+bool ps2_mouse_init(void)
+{
+    send_cmd(CMD_ENABLE_P2);
+    if (!send_cmd(CMD_READ_CONFIG))
+        return false;
+    int cfg = read_data();
+    if (cfg < 0 || (cfg & CFG_P2_CLOCK_OFF))
+        return false;    // no second port
+    flush();
+    if (!mouse_cmd(0xF6) || !mouse_cmd(0xF4))    // defaults, then start reporting
+        return false;
+    cfg |= CFG_P2_IRQ;
+    return write_config((uint8_t)cfg);
+}
+
 void ps2_reboot(void)
 {
     wait_write();

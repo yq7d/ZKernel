@@ -14,6 +14,9 @@ struct pipe {
     struct vnode rd, wr;
 };
 
+static int pipe_poll_rd(struct vnode *v);
+static int pipe_poll_wr(struct vnode *v);
+
 static int64_t pipe_read(struct vnode *v, void *buf, size_t len, uint64_t off)
 {
     (void)off;
@@ -37,6 +40,7 @@ static int64_t pipe_read(struct vnode *v, void *buf, size_t len, uint64_t off)
         p->count--;
     }
     waitq_wake_all(&p->writers);
+    poll_notify();
     irq_restore(flags);
     return (int64_t)n;
 }
@@ -65,6 +69,7 @@ static int64_t pipe_write(struct vnode *v, const void *buf, size_t len, uint64_t
         p->count++;
     }
     waitq_wake_all(&p->readers);
+    poll_notify();
     irq_restore(flags);
     return n ? (int64_t)n : ZK_EINTR;
 }
@@ -91,12 +96,32 @@ static void wr_release(struct vnode *v)
     uint64_t flags = irq_save();
     p->wr_open = false;
     waitq_wake_all(&p->readers);
+    poll_notify();
     maybe_free(p);
     irq_restore(flags);
 }
 
-static const struct vnode_ops rd_ops = { .read = pipe_read, .release = rd_release };
-static const struct vnode_ops wr_ops = { .write = pipe_write, .release = wr_release };
+static int pipe_poll_rd(struct vnode *v)
+{
+    struct pipe *p = v->priv;
+    int r = 0;
+    if (p->count)
+        r |= POLLIN;
+    if (!p->wr_open)
+        r |= POLLIN | POLLHUP;
+    return r;
+}
+
+static int pipe_poll_wr(struct vnode *v)
+{
+    struct pipe *p = v->priv;
+    if (!p->rd_open)
+        return POLLHUP;
+    return p->count < PIPE_SIZE ? POLLOUT : 0;
+}
+
+static const struct vnode_ops rd_ops = { .read = pipe_read, .release = rd_release, .poll = pipe_poll_rd };
+static const struct vnode_ops wr_ops = { .write = pipe_write, .release = wr_release, .poll = pipe_poll_wr };
 
 int pipe_create(struct file **rd, struct file **wr)
 {

@@ -1,0 +1,10 @@
+# device         mount point     type  options
+# disks are found by label, ones that aren't there are skipped
+LABEL=ZOSDATA    /data           ext2  defaults
+LABEL=ZOSBOOT    /boot           fat   defaults
+LABEL=ZOSSHARE   /mnt            fat   uid=1000,gid=1000
+# the persistent parts of the system live on /data
+/data/home       /home           bind  defaults
+/data/linux      /compat/linux   bind  defaults
+/data/pkg        /var/lib/pkg    bind  defaults
+/data/local      /usr/local      bind  defaults

@@ -95,6 +95,15 @@ static int tokenize(char *line, struct token *toks, char *store, size_t store_si
         char *w = store + used;
         size_t len = 0;
         char quote = 0;
+        // ~ at the start of a word is $HOME
+        if (*p == '~' && (p[1] == '/' || p[1] == '\0' || p[1] == ' ' || p[1] == '\t')) {
+            const char *home = getenv("HOME");
+            if (home) {
+                for (; *home && used + len + 1 < store_size; home++)
+                    w[len++] = *home;
+                p++;
+            }
+        }
         while (*p && (quote || (*p != ' ' && *p != '\t' && !strchr("|<>&;", *p)))) {
             char c = *p++;
             if (quote && c == quote) {
@@ -225,7 +234,7 @@ static bool is_file(const char *path)
 }
 
 // names without a slash are searched for in $PATH
-static bool resolve(const char *name, char *out)
+static bool resolve_cmd(const char *name, char *out)
 {
     if (strchr(name, '/')) {
         strlcpy(out, name, ZK_PATH_MAX);
@@ -290,7 +299,7 @@ static void run_file(const char *path);
 static void help(void)
 {
     printf("builtins: cd [dir], pwd, export NAME=value, unset NAME, source file,\n"
-           "          exit [code], help\n"
+           "          exec cmd, exit [code], help\n"
            "programs live in /bin, try ls /bin\n"
            "  a | b       pipe a into b\n"
            "  a > f       write to f, >> appends, < f reads from f\n"
@@ -313,6 +322,21 @@ static bool builtin(struct stage *s)
         if (e)
             err(dir, e);
         last_status = e ? 1 : 0;
+        return true;
+    }
+    if (strcmp(argv[0], "exec") == 0) {
+        // replaces the shell, only returns if that fails
+        if (s->argc < 2)
+            return true;
+        char path[ZK_PATH_MAX];
+        if (!resolve_cmd(argv[1], path)) {
+            dprintf(2, "sh: exec: %s: not found\n", argv[1]);
+            last_status = 127;
+            return true;
+        }
+        int e = execv(path, argv + 1);
+        err(argv[1], e);
+        last_status = 126;
         return true;
     }
     if (strcmp(argv[0], "export") == 0) {
@@ -407,7 +431,7 @@ static void run(struct stage *st, int ns, bool bg)
 
         char path[ZK_PATH_MAX];
         if (!failed) {
-            if (!resolve(s->argv[0], path)) {
+            if (!resolve_cmd(s->argv[0], path)) {
                 dprintf(2, "sh: %s: command not found\n", s->argv[0]);
                 failed = true;
             } else {
@@ -458,14 +482,24 @@ static void run(struct stage *st, int ns, bool bg)
         return;
     }
 
+    // a job can change the terminal (curses programs turn off echo and line
+    // editing) and die before putting it back, so the shell puts it back
+    uint32_t saved_mode;
+    bool tty = ioctl(0, TIOCGMODE, (uint64_t)&saved_mode) == 0;
     tty_setfg(pgid);
     int status = 0;
     for (int i = 0; i < spawned; i++)
         wait(pids[i], &status, 0);
     tty_setfg(0);
+    uint32_t mode;
+    bool changed = tty && ioctl(0, TIOCGMODE, (uint64_t)&mode) == 0 && mode != saved_mode;
+    if (changed)
+        ioctl(0, TIOCSMODE, saved_mode);
     last_status = failed ? 1 : status;
+    if ((status == ZK_EXIT_KILLED || changed) && interactive && tty)
+        printf("\e[0m\e[?25h");    // plain colors and a visible cursor again
     if (status == ZK_EXIT_KILLED && interactive)
-        printf("[killed]\n");
+        printf("\r\n[killed]\n");
 }
 
 struct reader {
@@ -599,6 +633,27 @@ int main(int argc, char **argv)
     interactive = fstat(0, &st) == 0 && st.type == ZK_TYPE_DEV;
     if (interactive && stat("/etc/profile", &st) == 0)
         run_file("/etc/profile");
+    char rc[ZK_PATH_MAX];
+    const char *home = getenv("HOME");
+    if (interactive && home) {
+        snprintf(rc, sizeof rc, "%s/.profile", home);
+        if (stat(rc, &st) == 0)
+            run_file(rc);
+    }
+    char user[32] = "?", host[64] = "zos";
+    struct passwd pw;
+    if (getpwuid(geteuid(), &pw) == 0)
+        strlcpy(user, pw.name, sizeof user);
+    int hfd = open("/etc/hostname", O_RDONLY);
+    if (hfd >= 0) {
+        long n = read(hfd, host, sizeof host - 1);
+        host[n > 0 ? n : 0] = '\0';
+        char *nl = strchr(host, '\n');
+        if (nl)
+            *nl = '\0';
+        close(hfd);
+    }
+    bool root = geteuid() == 0;
     if (interactive) {
         int fd = open("/etc/motd", O_RDONLY);
         if (fd >= 0) {
@@ -616,7 +671,16 @@ int main(int argc, char **argv)
             char cwd[ZK_PATH_MAX];
             if (getcwd(cwd, sizeof cwd) < 0)
                 strlcpy(cwd, "?", sizeof cwd);
-            printf("\e[1;32mzk\e[0m:\e[1;34m%s\e[0m%s ", cwd, last_status ? "\e[31m$\e[0m" : "$");
+            // ~ for home
+            const char *shown = cwd;
+            char tilde[ZK_PATH_MAX];
+            size_t hl = home ? strlen(home) : 0;
+            if (hl > 1 && strncmp(cwd, home, hl) == 0 && (cwd[hl] == '/' || !cwd[hl])) {
+                snprintf(tilde, sizeof tilde, "~%s", cwd + hl);
+                shown = tilde;
+            }
+            printf("\e[1;%dm%s@%s\e[0m:\e[1;34m%s\e[0m%s%c\e[0m ", root ? 31 : 32, user, host,
+                   shown, last_status ? "\e[31m" : "", root ? '#' : '$');
         }
         if (get_line(&in, line, sizeof line) < 0)
             break;

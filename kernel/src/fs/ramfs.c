@@ -44,6 +44,7 @@ static struct rnode *new_node(enum vnode_type type)
     r->v.ino = vfs_next_ino();
     r->v.ops = &ops;
     r->v.mtime = rtc_now();
+    r->v.mode = type == VNODE_DIR ? 0755 : 0644;
     return r;
 }
 
@@ -293,6 +294,14 @@ static int rename(struct vnode *odir, const char *oname, struct vnode *ndir, con
     return 0;
 }
 
+static int setattr(struct vnode *v, uint32_t uid, uint32_t gid, uint32_t mode)
+{
+    v->uid = uid;
+    v->gid = gid;
+    v->mode = mode;
+    return 0;
+}
+
 static void release(struct vnode *v)
 {
     struct rnode *r = RNODE(v);
@@ -322,6 +331,7 @@ static const struct vnode_ops ops = {
     .unlink = unlink,
     .readdir = readdir,
     .rename = rename,
+    .setattr = setattr,
     .release = release,
 };
 
@@ -335,12 +345,15 @@ static int ramfs_statfs(struct mount *m, struct zk_statfs *st)
     return 0;
 }
 
-static int ramfs_mount(struct mount *m, const char *source)
+static int ramfs_mount(struct mount *m, const char *source, const char *opts)
 {
     (void)source;
     struct rnode *r = new_node(VNODE_DIR);
     if (!r)
         return ZK_ENOMEM;
+    mount_opt(opts, "mode", &r->v.mode, 8);
+    mount_opt(opts, "uid", &r->v.uid, 10);
+    mount_opt(opts, "gid", &r->v.gid, 10);
     m->root = &r->v;
     m->statfs = ramfs_statfs;
     return 0;

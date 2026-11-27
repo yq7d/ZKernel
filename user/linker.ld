@@ -6,6 +6,7 @@ PHDRS
     text   PT_LOAD;
     rodata PT_LOAD;
     data   PT_LOAD;
+    note   PT_NOTE;
 }
 
 SECTIONS
@@ -20,6 +21,11 @@ SECTIONS
     .rodata : {
         *(.rodata .rodata.*)
     } :rodata
+
+    /* tells the kernel this is a zos program, not a linux one */
+    .note.zos : {
+        KEEP(*(.note.zos))
+    } :rodata :note
 
     . = ALIGN(4096);
     .data : {

@@ -114,7 +114,8 @@ static void gen_disks(struct gen *g)
     blk_get_stats(&s);
     for (int i = 0; i < blk_count(); i++) {
         struct blkdev *d = blk_get(i);
-        out(g, "%s %lu\n", d->name, d->sectors * SECTOR_SIZE);
+        out(g, "%s %lu %s %s\n", d->name, d->sectors * SECTOR_SIZE, d->is_part ? "part" : "disk",
+            d->model[0] ? d->model : "-");
     }
     out(g, "# cache hits %lu misses %lu writes %lu\n", s.hits, s.misses, s.writes);
 }
@@ -203,16 +204,17 @@ static const struct vnode_ops dir_ops = {
     .unlink = dir_unlink,
 };
 
-static struct vnode root = { .type = VNODE_DIR, .refs = 1, .ops = &dir_ops, .size = NFILES };
+static struct vnode root = { .type = VNODE_DIR, .refs = 1, .ops = &dir_ops, .size = NFILES,
+                             .mode = 0555 };
 
-static int procfs_mount(struct mount *m, const char *source)
+static int procfs_mount(struct mount *m, const char *source, const char *opts)
 {
-    (void)source;
+    (void)source; (void)opts;
     if (!root.ino) {
         root.ino = vfs_next_ino();
         for (size_t i = 0; i < NFILES; i++)
             nodes[i] = (struct vnode){ .type = VNODE_FILE, .refs = 1, .ino = vfs_next_ino(),
-                                       .ops = &file_ops, .priv = (void *)i };
+                                       .mode = 0444, .ops = &file_ops, .priv = (void *)i };
     }
     vnode_get(&root);
     m->root = &root;

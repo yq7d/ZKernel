@@ -44,8 +44,12 @@ struct thread {
     struct address_space *as;    // NULL for kernel threads
     struct proc *proc;           // NULL for kernel threads
     struct fpu_state *fpu;
+    uint64_t fs_base;            // thread pointer, for tls
 
-    struct thread *next;         // run queue, wait queue or sleep list
+    struct thread *next;         // run queue or wait queue
+    struct thread *sleep_next;   // sleep list
+    struct waitq *timed_wq;      // set while in waitq_sleep_timeout
+    bool timed_out;
     struct thread *all_next;
 };
 
@@ -67,6 +71,8 @@ void thread_sleep_ms(uint64_t ms);
 void waitq_sleep(struct waitq *wq);
 void waitq_wake_one(struct waitq *wq);
 void waitq_wake_all(struct waitq *wq);
+// like waitq_sleep, but gives up after ms. false on timeout
+bool waitq_sleep_timeout(struct waitq *wq, uint64_t ms);
 
 void sched_tick(void);
 void sched_preempt(void);
