@@ -13,6 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
+#include <linux/fb.h>
+#include <linux/input.h>
+#include <linux/kd.h>
+#include <linux/vt.h>
+#include <sys/ioctl.h>
+#include <sys/sysmacros.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
@@ -694,8 +700,101 @@ static void test_signals(void)
     signal(SIGUSR2, SIG_DFL);
 }
 
+#define HAS(bits, n) ((bits)[(n) / 8] & (1 << ((n) % 8)))
+
+static void test_devices(void)
+{
+    // fbdev: modes and a mapping of the screen
+    int fb = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+    CHECK(fb >= 0);
+    struct fb_var_screeninfo var;
+    struct fb_fix_screeninfo fix;
+    CHECK(ioctl(fb, FBIOGET_VSCREENINFO, &var) == 0 && var.xres > 0 && var.bits_per_pixel == 32);
+    CHECK(ioctl(fb, FBIOPUT_VSCREENINFO, &var) == 0);
+    CHECK(ioctl(fb, FBIOGET_FSCREENINFO, &fix) == 0 && fix.line_length >= var.xres * 4 &&
+          fix.smem_len >= fix.line_length * var.yres && fix.visual == FB_VISUAL_TRUECOLOR);
+    uint32_t *px = mmap(NULL, fix.smem_len, PROT_READ | PROT_WRITE, MAP_SHARED, fb, 0);
+    CHECK(px != MAP_FAILED);
+    if (px != MAP_FAILED) {
+        px[0] = 0x00ff8800;
+        CHECK(px[0] == 0x00ff8800);
+        CHECK(munmap(px, fix.smem_len) == 0);
+    }
+    close(fb);
+
+    // evdev
+    int kb = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+    int ms = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
+    CHECK(kb >= 0 && ms >= 0);
+    char name[64] = "";
+    CHECK(ioctl(kb, EVIOCGNAME(sizeof name), name) > 0 && strstr(name, "keyboard"));
+    int ver = 0;
+    CHECK(ioctl(kb, EVIOCGVERSION, &ver) == 0 && ver == EV_VERSION);
+    uint8_t ev[4] = { 0 }, keys[96] = { 0 }, rel[2] = { 0 };
+    CHECK(ioctl(kb, EVIOCGBIT(0, sizeof ev), ev) > 0 && HAS(ev, EV_KEY) && !HAS(ev, EV_REL));
+    CHECK(ioctl(kb, EVIOCGBIT(EV_KEY, sizeof keys), keys) > 0 && HAS(keys, KEY_A) &&
+          HAS(keys, KEY_LEFTMETA) && !HAS(keys, BTN_LEFT));
+    memset(ev, 0, sizeof ev);
+    memset(keys, 0, sizeof keys);
+    CHECK(ioctl(ms, EVIOCGBIT(0, sizeof ev), ev) > 0 && HAS(ev, EV_REL));
+    CHECK(ioctl(ms, EVIOCGBIT(EV_KEY, sizeof keys), keys) > 0 && HAS(keys, BTN_LEFT));
+    CHECK(ioctl(ms, EVIOCGBIT(EV_REL, sizeof rel), rel) > 0 && HAS(rel, REL_X) && HAS(rel, REL_Y));
+    struct input_id id;
+    CHECK(ioctl(ms, EVIOCGID, &id) == 0 && id.bustype == BUS_I8042);
+    int clk = CLOCK_MONOTONIC;
+    CHECK(ioctl(kb, EVIOCSCLOCKID, &clk) == 0);
+    struct input_event ie;
+    CHECK(read(kb, &ie, sizeof ie) == -1 && errno == EAGAIN);
+    struct stat a, b;
+    CHECK(fstat(kb, &a) == 0 && fstat(ms, &b) == 0 && S_ISCHR(a.st_mode) &&
+          major(a.st_rdev) == 13 && a.st_rdev != b.st_rdev);
+    struct pollfd pf = { kb, POLLIN, 0 };
+    CHECK(poll(&pf, 1, 0) == 0);
+    close(kb);
+    close(ms);
+
+    // the console as a vt
+    int vt = open("/dev/tty0", O_RDWR | O_CLOEXEC);
+    CHECK(vt >= 0);
+    struct vt_stat vs;
+    CHECK(ioctl(vt, VT_GETSTATE, &vs) == 0 && vs.v_active >= 1);
+    int n = -1, mode = -1;
+    CHECK(ioctl(vt, VT_OPENQRY, &n) == 0 && n >= 1);
+    CHECK(ioctl(vt, KDGETMODE, &mode) == 0 && mode == KD_TEXT);
+    CHECK(ioctl(vt, KDSETMODE, KD_GRAPHICS) == 0 && ioctl(vt, KDGETMODE, &mode) == 0 && mode == KD_GRAPHICS);
+    CHECK(ioctl(vt, KDSETMODE, KD_TEXT) == 0);
+    CHECK(ioctl(vt, KDGKBMODE, &mode) == 0);
+    struct vt_mode vm = { .mode = VT_PROCESS, .relsig = SIGUSR1, .acqsig = SIGUSR2 };
+    CHECK(ioctl(vt, VT_SETMODE, &vm) == 0);
+    memset(&vm, 0, sizeof vm);
+    CHECK(ioctl(vt, VT_GETMODE, &vm) == 0 && vm.mode == VT_PROCESS && vm.relsig == SIGUSR1);
+    vm.mode = VT_AUTO;
+    ioctl(vt, VT_SETMODE, &vm);
+    close(vt);
+}
+
+// ltest evdev N: prints the next N events from a device, for poking by hand
+static int dump_events(const char *dev, int n)
+{
+    int fd = open(dev, O_RDONLY);
+    if (fd < 0) {
+        perror(dev);
+        return 1;
+    }
+    struct input_event ie;
+    while (n > 0 && read(fd, &ie, sizeof ie) == sizeof ie) {
+        printf("type %d code %d value %d\n", ie.type, ie.code, ie.value);
+        if (ie.type != EV_SYN)
+            n--;
+    }
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 4 && strcmp(argv[1], "evdev") == 0)
+        return dump_events(argv[2], atoi(argv[3]));
     printf("ltest: glibc %s, pid %d\n", "static", getpid());
     struct utsname u;
     CHECK(uname(&u) == 0 && strcmp(u.sysname, "Linux") == 0);
@@ -767,6 +866,7 @@ int main(int argc, char **argv)
     test_threads();
     test_unix();
     test_events();
+    test_devices();
 
     printf("ltest: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

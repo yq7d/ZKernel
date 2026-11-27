@@ -5,6 +5,7 @@
 #include "proc/proc.h"
 #include "proc/futex.h"
 #include "proc/lfd.h"
+#include "console/console.h"
 #include "fs/shmem.h"
 #include "proc/sys.h"
 #include "arch/x86_64/cpu.h"
@@ -164,7 +165,8 @@ static int64_t put_stat(const struct zk_stat *st, uint64_t ubuf)
     l.mode = type_bits(st->type) | (st->mode & 07777);
     l.uid = st->uid;
     l.gid = st->gid;
-    l.rdev = st->type == ZK_TYPE_DEV ? 0x0501 : 0;
+    if (st->type == ZK_TYPE_DEV)
+        l.rdev = dev_rdev(st->ino) ? dev_rdev(st->ino) : 0x0501;
     l.size = (int64_t)st->size;
     l.blksize = 4096;
     l.blocks = (int64_t)((st->size + 511) / 512);
@@ -389,12 +391,84 @@ struct termios2 {
 #define L_ICANON 0000002
 #define L_ECHO   0000010
 
+// the console as a linux vt. there's only the one, vt 1
+static int kd_mode, kb_mode = 3;    // KD_TEXT, K_UNICODE
+static uint8_t vt_mode[8];          // struct vt_mode, kept for VT_GETMODE
+
+static int64_t kd_ioctl(unsigned long req, uint64_t arg)
+{
+    int32_t v;
+    switch (req) {
+    case 0x4B3A:    // KDSETMODE: graphics stops console drawing
+        if (arg > 1)
+            return ZK_EINVAL;
+        if ((int)arg != kd_mode)
+            console_suspend(arg == 1);
+        kd_mode = (int)arg;
+        return 0;
+    case 0x4B3B:    // KDGETMODE
+        v = kd_mode;
+        return copy_out(arg, &v, 4);
+    case 0x4B33: {  // KDGKBTYPE
+        uint8_t type = 2;    // KB_101
+        return copy_out(arg, &type, 1);
+    }
+    case 0x4B44:    // KDGKBMODE
+        v = kb_mode;
+        return copy_out(arg, &v, 4);
+    case 0x4B45:    // KDSKBMODE, evdev readers take the keys anyway
+        kb_mode = (int)arg;
+        return 0;
+    case 0x4B31:    // KDGETLED
+    case 0x4B64: {  // KDGKBLED
+        uint8_t led = 0;
+        return copy_out(arg, &led, 1);
+    }
+    case 0x4B32:    // KDSETLED
+    case 0x4B65:    // KDSKBLED
+    case 0x4B2F:    // KIOCSOUND
+    case 0x4B30:    // KDMKTONE
+        return 0;
+    }
+    return ZK_EINVAL;
+}
+
+static int64_t vt_ioctl(unsigned long req, uint64_t arg)
+{
+    switch (req) {
+    case 0x5600: {  // VT_OPENQRY
+        int32_t n = 1;
+        return copy_out(arg, &n, 4);
+    }
+    case 0x5601:    // VT_GETMODE
+        return copy_out(arg, vt_mode, sizeof vt_mode);
+    case 0x5602:    // VT_SETMODE
+        return copy_in(vt_mode, arg, sizeof vt_mode) ? ZK_EFAULT : 0;
+    case 0x5603: {  // VT_GETSTATE: active, signal, in use bits
+        uint16_t st[3] = { 1, 0, 1 << 1 };
+        return copy_out(arg, st, sizeof st);
+    }
+    case 0x5605:    // VT_RELDISP
+    case 0x5606:    // VT_ACTIVATE
+    case 0x5607:    // VT_WAITACTIVE
+    case 0x5608:    // VT_DISALLOCATE
+        return 0;
+    }
+    return ZK_EINVAL;
+}
+
 static int64_t l_ioctl(int fd, unsigned long req, uint64_t arg)
 {
     struct file *f = fd_file(fd);
     if (!f)
         return ZK_EBADF;
     struct tty *t = tty_of(f->v);
+    if (!t && f->v->ops->lioctl)
+        return f->v->ops->lioctl(f->v, f, req, arg);
+    if (t && (req >> 8) == 0x4B)
+        return kd_ioctl(req, arg);
+    if (t && (req >> 8) == 0x56)
+        return vt_ioctl(req, arg);
     switch (req) {
     case 0x5401:        // TCGETS
     case 0x802C542A: {  // TCGETS2, termios plus two speeds
@@ -469,6 +543,7 @@ static int64_t l_ioctl(int fd, unsigned long req, uint64_t arg)
         f->flags = on ? f->flags | O_NONBLOCK : f->flags & ~O_NONBLOCK;
         return 0;
     }
+    case 0x5422:    // TIOCNOTTY
     case 0x540E:    // TIOCSCTTY
     case 0x5451:    // FIOCLEX
         return t ? 0 : ZK_ENOTTY;
@@ -578,7 +653,7 @@ static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, 
         f = fd_file(fd);
         if (!f)
             return ZK_EBADF;
-        if (f->v->type != VNODE_FILE)
+        if (f->v->type != VNODE_FILE && !f->v->ops->mmap)
             return ZK_ENODEV;
     }
 
@@ -605,6 +680,16 @@ static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, 
         if (!f)
             vnode_put(v);    // the mappings hold the pages now
         return err ? err : (int64_t)start;
+    }
+
+    // device memory, the framebuffer
+    if (f && f->v->ops->mmap) {
+        int err = f->v->ops->mmap(f->v, f, start, len, off, pf);
+        if (err) {
+            unmap_range(as, start, len);
+            return err;
+        }
+        return (int64_t)start;
     }
 
     // reservations get no pages, mprotect fills them in later

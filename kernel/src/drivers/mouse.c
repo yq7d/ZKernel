@@ -6,6 +6,7 @@
 #include "arch/x86_64/io.h"
 #include "fs/vfs.h"
 #include "proc/proc.h"
+#include "drivers/evdev.h"
 
 #define EVENTS 128
 
@@ -15,8 +16,25 @@ static struct zk_mouse_event events[EVENTS];
 static size_t head, count;
 static struct waitq readers = WAITQ_INIT;
 
+static void push_evdev(int dx, int dy, uint8_t buttons)
+{
+    static uint8_t last;
+    struct evdev *d = &evdev_mouse;
+    if (dx)
+        evdev_push(d, EV_REL, REL_X, dx);
+    if (dy)
+        evdev_push(d, EV_REL, REL_Y, dy);
+    static const uint16_t btn[3] = { BTN_LEFT, BTN_RIGHT, BTN_MIDDLE };
+    for (int i = 0; i < 3; i++)
+        if ((buttons ^ last) & (1 << i))
+            evdev_push(d, EV_KEY, btn[i], (buttons >> i) & 1);
+    last = buttons;
+    evdev_sync(d);
+}
+
 static void push(int dx, int dy, uint8_t buttons)
 {
+    push_evdev(dx, dy, buttons);
     // merge plain movement into the last event when nobody's keeping up
     if (count) {
         struct zk_mouse_event *last = &events[(head + count - 1) % EVENTS];

@@ -6,6 +6,7 @@
 #include "arch/x86_64/cpu.h"
 #include "lib/spinlock.h"
 #include "drivers/tty.h"
+#include "drivers/evdev.h"
 #include "fs/vfs.h"
 #include "proc/proc.h"
 #include "sched/sched.h"
@@ -152,6 +153,34 @@ static int translate(uint8_t code, bool ext)
     return (unsigned char)c;
 }
 
+// set 1 to linux keycodes. plain codes are the same up to f12
+static uint16_t linux_code(uint8_t code, bool ext)
+{
+    if (!ext)
+        return code <= 0x58 ? code : 0;
+    switch (code) {
+    case 0x1C: return 96;     // kp enter
+    case 0x1D: return 97;     // right ctrl
+    case 0x35: return 98;     // kp slash
+    case 0x37: return 99;     // sysrq
+    case 0x38: return 100;    // right alt
+    case 0x47: return 102;    // home
+    case 0x48: return 103;
+    case 0x49: return 104;
+    case 0x4B: return 105;
+    case 0x4D: return 106;
+    case 0x4F: return 107;
+    case 0x50: return 108;
+    case 0x51: return 109;
+    case 0x52: return 110;
+    case 0x53: return 111;
+    case 0x5B: return 125;    // left meta
+    case 0x5C: return 126;
+    case 0x5D: return 127;    // menu
+    }
+    return 0;
+}
+
 static void handle_scancode(uint8_t sc)
 {
     if (sc == SC_EXTENDED) {
@@ -184,6 +213,14 @@ static void handle_scancode(uint8_t sc)
     }
 
     int key = released ? 0 : translate(code, ext);
+    // key state is kept even with nobody reading
+    uint16_t lc = linux_code(code, ext);
+    if (lc) {
+        evdev_push(&evdev_kbd, EV_KEY, lc, !released);
+        evdev_sync(&evdev_kbd);
+    }
+    if (evdev_open(&evdev_kbd) && !grabbed)
+        return;    // an evdev reader has the keyboard
     if (grabbed) {
         push_event((uint16_t)(code | (ext ? 0x80 : 0)), !released, key);
         return;

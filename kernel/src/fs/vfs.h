@@ -44,6 +44,11 @@ struct vnode_ops {
     int (*ioctl)(struct vnode *v, struct file *f, unsigned long req, uint64_t arg);
     // POLLIN/POLLOUT/POLLHUP bits, called with interrupts off so it can't block
     int (*poll)(struct vnode *v);
+    // linux programs' ioctls, numbered the linux way
+    int (*lioctl)(struct vnode *v, struct file *f, unsigned long req, uint64_t arg);
+    // maps device memory at va (page aligned, len bytes) in the current space
+    int (*mmap)(struct vnode *v, struct file *f, uint64_t va, uint64_t len,
+                uint64_t off, uint64_t pte_flags);
 };
 
 struct vnode {
@@ -171,3 +176,5 @@ int file_ioctl(struct file *f, unsigned long req, uint64_t arg);
 
 // dev.c
 void dev_init(void);
+// linux major:minor of a device inode, 0 if unknown
+uint32_t dev_rdev(uint64_t ino);
