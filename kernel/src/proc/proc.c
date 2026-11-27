@@ -443,6 +443,7 @@ struct thread *proc_spawn(const char *path, char **argv, char **envp,
         goto fail;
     apply_setid(&p->cred, &st);
     p->abi = abi;
+    p->altstack_flags = SS_DISABLE;
     strlcpy(p->exe, path, sizeof p->exe);
     // the terminal on stdin becomes the controlling one, else the parent's
     if (o->std[0] && tty_of(o->std[0]->v))
@@ -512,6 +513,7 @@ int64_t proc_fork(struct interrupt_frame *frame, uint64_t new_rsp, uint64_t chil
     p->cred = me->cred;
     p->abi = me->abi;
     p->cloexec = me->cloexec;
+    signal_fork(p, me);
     p->ctty = me->ctty;
     if (p->ctty)
         vnode_get(p->ctty);
@@ -565,6 +567,7 @@ int proc_exec(const char *path, char **argv, char **envp, void *release)
         }
     }
     me->cloexec = 0;
+    signal_exec(me);
     t->fs_base = 0;
     wrmsr(MSR_FS_BASE, 0);
 
@@ -621,14 +624,12 @@ bool cred_in_group(const struct zk_cred *c, uint32_t gid)
 bool proc_killed(void)
 {
     struct proc *p = proc_current();
-    return p && p->killed;
+    return p && signal_pending(p);
 }
 
-// interrupts off
-static void kill_locked(struct proc *p)
+static bool alive(struct proc *p)
 {
-    p->killed = true;
-    waitq_wake_all(&p->child_wq);
+    return p->thread && p->thread->state != THREAD_DEAD;
 }
 
 int proc_kill(uint64_t pid)
@@ -636,8 +637,8 @@ int proc_kill(uint64_t pid)
     int err = ZK_ESRCH;
     uint64_t flags = irq_save();
     for (struct proc *p = procs; p; p = p->list_next) {
-        if (p->pid == pid && p->thread->state != THREAD_DEAD) {
-            kill_locked(p);
+        if (p->pid == pid && alive(p)) {
+            signal_send(p, SIGKILL, NULL);
             err = 0;
         }
     }
@@ -645,13 +646,14 @@ int proc_kill(uint64_t pid)
     return err;
 }
 
-int proc_kill_group(uint64_t pgid)
+int proc_signal_group(uint64_t pgid, int sig)
 {
     int n = 0;
+    struct ksiginfo si = { .code = SI_KERNEL };
     uint64_t flags = irq_save();
     for (struct proc *p = procs; p; p = p->list_next) {
-        if (p->pgid == pgid && p->thread->state != THREAD_DEAD) {
-            kill_locked(p);
+        if (p->pgid == pgid && alive(p)) {
+            signal_send(p, sig, &si);
             n++;
         }
     }
@@ -659,12 +661,54 @@ int proc_kill_group(uint64_t pgid)
     return n;
 }
 
-void proc_check_killed(void)
+int proc_kill_group(uint64_t pgid)
 {
-    if (proc_killed()) {
-        sti();
-        proc_exit(ZK_EXIT_KILLED);
+    return proc_signal_group(pgid, SIGKILL);
+}
+
+static bool may_signal(const struct zk_cred *c, const struct proc *p)
+{
+    return c->euid == 0 || c->uid == p->cred.uid || c->euid == p->cred.uid ||
+           c->uid == p->cred.suid || c->euid == p->cred.suid;
+}
+
+int proc_signal(int64_t pid, int sig, int code)
+{
+    if (sig < 0 || sig > NSIG)
+        return ZK_EINVAL;
+    struct proc *me = proc_current();
+    const struct zk_cred *c = cred_current();
+    struct ksiginfo si = { .code = code, .pid = me ? (int)me->pid : 0, .uid = c->uid };
+    bool found = false, allowed = false;
+    uint64_t flags = irq_save();
+    for (struct proc *p = procs; p; p = p->list_next) {
+        if (!alive(p))
+            continue;
+        bool hit = pid > 0 ? p->pid == (uint64_t)pid
+                 : pid == 0 ? me && p->pgid == me->pgid
+                 : pid == -1 ? p->pid != 1 && p != me
+                 : p->pgid == (uint64_t)-pid;
+        if (!hit)
+            continue;
+        found = true;
+        if (!may_signal(c, p))
+            continue;
+        allowed = true;
+        if (sig)
+            signal_send(p, sig, &si);
     }
+    irq_restore(flags);
+    if (!found)
+        return ZK_ESRCH;
+    return allowed ? 0 : ZK_EPERM;
+}
+
+void proc_exit_signal(int sig, bool core)
+{
+    struct proc *p = proc_current();
+    p->death_sig = sig;
+    p->core = core;
+    proc_exit(128 + sig);
 }
 
 void proc_exit(int code)
@@ -679,8 +723,15 @@ void proc_exit(int code)
         c->parent = NULL;
         thread_detach(c->thread);
     }
-    if (p->parent)
+    if (p->parent) {
+        struct ksiginfo si = {
+            .code = p->death_sig ? (p->core ? CLD_DUMPED : CLD_KILLED) : CLD_EXITED,
+            .pid = (int)p->pid, .uid = p->cred.uid,
+            .status = p->death_sig ? p->death_sig : code & 0xff,
+        };
+        signal_send(p->parent, SIGCHLD, &si);
         waitq_wake_all(&p->parent->child_wq);
+    }
     thread_exit(code);
 }
 
@@ -706,18 +757,19 @@ int64_t proc_wait(int64_t pid, int *status, int flags)
         }
         if (found) {
             int64_t id = (int64_t)found->pid;
+            int extra = found->death_sig << 16 | (found->core ? 1 << 24 : 0);
             found->parent = NULL;
             irq_restore(flags_irq);
             int code = thread_join(found->thread);    // frees found
             if (status)
-                *status = code;
+                *status = (code & 0xffff) | extra;
             return id;
         }
         if (flags & WNOHANG) {
             irq_restore(flags_irq);
             return 0;
         }
-        if (me->killed) {
+        if (signal_pending(me)) {
             irq_restore(flags_irq);
             return ZK_EINTR;
         }

@@ -49,7 +49,8 @@ This uses Alpine and not the Arch AUR because AUR packages are build scripts. Th
 
 ### Linux programs
 ZOS runs x86_64 Linux binaries, both static ones (glibc or musl) and Alpine's dynamically linked musl ones. Like FreeBSD's Linux layer, Linux programs see `/compat/linux` laid over `/`: a path that exists in there wins.
-What doesn't work yet: threads, signals, listening sockets, and anything that reads Linux's own `/proc` files (so `htop` installs but can't show anything).
+Signals work like on Linux: handlers (with `SA_SIGINFO`, `SA_RESTART`, `SA_ONSTACK`), masks, `sigsuspend`, `sigaltstack`, faults as catchable `SIGSEGV`/`SIGILL`/`SIGFPE`, `SIGCHLD`, and wait statuses that say which signal killed a child. Ctrl+C sends `SIGINT` and Ctrl+\ sends `SIGQUIT`.
+What doesn't work yet: threads, job control (Ctrl+Z, `SIGSTOP`), `alarm`, listening sockets, and anything that reads Linux's own `/proc` files (so `htop` installs but can't show anything).
 
 ### Files that stay
 Disks are found by filesystem label (see `/etc/fstab`), so it doesn't matter what the disk is called:
@@ -91,7 +92,7 @@ What ZOS can drive on a real PC:
 x86_64, boots with Limine (BIOS and UEFI), single cpu.
 
 - **memory:** physical page allocator, per process address spaces, copy on write, kernel heap, guard pages on kernel stacks
-- **processes:** preemptive scheduler, ring 3 user programs (static ELF), `fork`, `exec`, `spawn`, `wait`, environment variables, ctrl+c kills the foreground job, stacks that grow on demand
+- **processes:** preemptive scheduler, ring 3 user programs (static ELF), `fork`, `exec`, `spawn`, `wait`, environment variables, signals (ctrl+c sends `SIGINT` to the foreground job), stacks that grow on demand
 - **users:** uids, gids, groups, file permissions, set-user-id programs, `sudo`, `su`, `passwd`
 - **files:** VFS with mounts and symlinks, ramfs root unpacked from an initrd, ext2 and FAT32 (both read/write, and both can be created with `mkfs.ext2` / `mkfs.fat`), MBR and GPT partitions, bind mounts, `/proc`, `/dev`, pipes, a write-back disk cache
 - **network:** virtio-net, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS, sockets, an HTTP client (`fetch`, `ping`, `host`, `ifconfig`)
@@ -114,9 +115,11 @@ make disk         # wipe disk.img and make a fresh one
 make clean        # everything except disk.img
 ```
 
-`disk.img` is a 1 GiB sparse image (64 MiB FAT32 plus ext2, see "Files that stay" above). It survives rebuilds. If yours was made by an older build, run `make disk` once to get the current layout and labels. That wipes it.
+`disk.img` is a 30 GiB sparse image (it only takes the space that is actually used) (64 MiB FAT32 plus ext2, see "Files that stay" above). It survives rebuilds. If yours was made by an older build, run `make disk` once to get the current layout and labels. That wipes it.
 
 `make vbox` (`./scripts/vbox.sh`) makes a VirtualBox VM called ZKernel, or fixes an existing one with `--name`. If VirtualBox boots it and Limine says "This CPU does not support 64-bit mode", the VM's OS type is a 32 bit one: the script sets it to Other/Unknown (64-bit) with long mode on. If it still fails, VT-x/AMD-V is off in the host BIOS, or on Windows, Hyper-V is in the way. `disk.img` is copied to `disk.vdi` the first time, so changes made in VirtualBox stay in that copy.
+
+On Windows, double click `scripts\vbox.bat` and pick the ISO, or run `scripts\vbox.bat zkernel.iso -Disk disk.img`. It does the same setup through `scripts\vbox.ps1` (`-Name`, `-Mem`, `-Cpus`, `-Uefi`, `-NoStart`).
 
 `make run` gives the VM a network card with QEMU's user networking. `./scripts/vm.sh --no-net` leaves it out.
 

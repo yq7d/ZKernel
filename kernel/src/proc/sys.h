@@ -19,6 +19,8 @@ struct exec_args {
 };
 
 bool user_ok(uint64_t addr, size_t len, bool write);
+int copy_out(uint64_t dst, const void *src, size_t len);
+int copy_in(void *dst, uint64_t src, size_t len);
 int get_string(uint64_t addr, char *buf, size_t size);
 // user path -> absolute normalized path
 int get_path(uint64_t addr, char *out);

@@ -65,7 +65,7 @@ all: $(ISO) $(DISK)
 # made once and kept, it's the persistent storage (see /etc/fstab):
 #   partition 1, fat32, /mnt. easy to reach from the host with mtools
 #   partition 2, ext2, /data. home, installed packages, /usr/local
-DISK_MB := 1024
+DISK_MB := 30720
 FAT_MB  := 64
 $(DISK):
 	dd if=/dev/zero of=$@ bs=1M count=0 seek=$(DISK_MB) status=none

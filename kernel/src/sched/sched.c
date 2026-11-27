@@ -84,6 +84,7 @@ static void make_ready(struct thread *t)
         t->timed_wq = NULL;
         t->timed_out = false;
     }
+    t->blocked_on = NULL;
     t->state = THREAD_READY;
     enqueue(&ready, t);
     if (current == idle_thread)
@@ -348,6 +349,7 @@ void thread_sleep_ms(uint64_t ms)
 void waitq_sleep(struct waitq *wq)
 {
     current->state = THREAD_BLOCKED;
+    current->blocked_on = wq;
     enqueue(wq, current);
     schedule();
 }
@@ -356,6 +358,7 @@ bool waitq_sleep_timeout(struct waitq *wq, uint64_t ms)
 {
     uint64_t ticks = (ms * TIMER_HZ + 999) / 1000;
     current->state = THREAD_BLOCKED;
+    current->blocked_on = wq;
     enqueue(wq, current);
     current->timed_wq = wq;
     current->timed_out = false;
@@ -382,6 +385,17 @@ void waitq_wake_all(struct waitq *wq)
     while ((t = dequeue(wq)))
         make_ready(t);
     irq_restore(flags);
+}
+
+void thread_interrupt(struct thread *t)
+{
+    if (t->state == THREAD_SLEEPING) {
+        unlink_sleeper(t);
+        make_ready(t);
+    } else if (t->state == THREAD_BLOCKED && t->blocked_on) {
+        unlink_waiter(t->blocked_on, t);
+        make_ready(t);
+    }
 }
 
 // timer irq, interrupts are off

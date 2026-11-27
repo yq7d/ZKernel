@@ -5,7 +5,7 @@
 #
 #   -N, --name NAME   vm name, default ZKernel. an existing vm gets fixed up
 #   -u, --uefi        boot with efi firmware
-#   -m, --mem MB      default 512
+#   -m, --mem MB      default 4096
 #   -c, --cpus N      default 2
 #       --no-disk     don't attach disk.img
 #       --no-start    set the vm up but don't boot it
@@ -13,7 +13,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ISO="$ROOT/build/zkernel.iso"
-NAME=ZKernel UEFI=0 MEM=512 CPUS=2 DISK=1 START=1
+NAME=ZKernel UEFI=0 MEM=4096 CPUS=2 DISK=1 START=1
 
 while (($#)); do
     case "$1" in

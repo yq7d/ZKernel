@@ -660,18 +660,9 @@ static int64_t l_wait4(int64_t pid, uint64_t ustatus, int options, uint64_t urus
     int code = 0;
     int64_t r = proc_wait(pid > 0 ? pid : -1, &code, options & 1 ? WNOHANG : 0);
     if (r > 0 && ustatus) {
-        // killed ones look like they died from a signal
-        int status;
-        if (code == ZK_EXIT_KILLED)
-            status = 2;
-        else if (code == 128 + 14 || code == 128 + 13)
-            status = 11;
-        else if (code == 128 + 6)
-            status = 4;
-        else if (code == 128 + 0)
-            status = 8;
-        else
-            status = (code & 0xff) << 8;
+        int sig = PROC_STATUS_SIG(code);
+        int status = sig ? sig | (PROC_STATUS_CORE(code) ? 0x80 : 0)
+                         : (code & 0xff) << 8;
         *(int32_t *)ustatus = status;
     }
     return r;
@@ -708,21 +699,138 @@ static int64_t l_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     return err;
 }
 
-static int64_t l_kill(int64_t pid, int sig)
+static int64_t l_kill(int64_t pid, int sig, int code)
 {
-    if (pid <= 0)
-        return 0;    // groups aren't worth it here
-    if (sig == 0) {
-        struct zk_procinfo info[64];
-        int n = proc_snapshot(info, 64);
-        for (int i = 0; i < n; i++)
-            if ((int64_t)info[i].pid == pid)
-                return 0;
-        return ZK_ESRCH;
+    return proc_signal(pid, sig, code);
+}
+
+// signals
+
+static int64_t l_sigaction(int sig, uint64_t uact, uint64_t uold, uint64_t size)
+{
+    if (size != 8 || sig < 1 || sig > NSIG)
+        return ZK_EINVAL;
+    struct proc *p = me();
+    struct ksigaction act;
+    if (uact) {
+        if (sig == SIGKILL || sig == SIGSTOP)
+            return ZK_EINVAL;
+        if (copy_in(&act, uact, sizeof act))
+            return ZK_EFAULT;
+        act.mask &= ~SIG_UNBLOCKABLE;
     }
-    if ((uint64_t)pid == me()->pid && (sig == 6 || sig == 9 || sig == 15 || sig == 2))
-        proc_exit(sig == 6 ? 134 : 128 + sig);
-    return sys_kill((uint64_t)pid);
+    if (uold && copy_out(uold, &p->sigact[sig - 1], sizeof act))
+        return ZK_EFAULT;
+    if (uact) {
+        uint64_t flags = irq_save();
+        p->sigact[sig - 1] = act;
+        // a pending signal that's now ignored goes away
+        if (act.handler == SIG_IGN || (act.handler == SIG_DFL && signal_default_ignores(sig)))
+            p->sig_pending &= ~SIGBIT(sig);
+        irq_restore(flags);
+    }
+    return 0;
+}
+
+static int64_t l_sigprocmask(int how, uint64_t uset, uint64_t uold, uint64_t size)
+{
+    if (size != 8)
+        return ZK_EINVAL;
+    struct proc *p = me();
+    uint64_t old = p->sig_blocked, set = 0;
+    if (uset && copy_in(&set, uset, 8))
+        return ZK_EFAULT;
+    if (uset) {
+        uint64_t n;
+        switch (how) {
+        case 0:  n = old | set; break;     // SIG_BLOCK
+        case 1:  n = old & ~set; break;    // SIG_UNBLOCK
+        case 2:  n = set; break;           // SIG_SETMASK
+        default: return ZK_EINVAL;
+        }
+        uint64_t flags = irq_save();
+        p->sig_blocked = n & ~SIG_UNBLOCKABLE;
+        irq_restore(flags);
+    }
+    return uold && copy_out(uold, &old, 8) ? ZK_EFAULT : 0;
+}
+
+static struct waitq never = WAITQ_INIT;
+
+// sleeps until a signal shows up
+static int64_t wait_signal(void)
+{
+    uint64_t flags = irq_save();
+    while (!proc_killed())
+        waitq_sleep(&never);
+    irq_restore(flags);
+    return ZK_EINTR;
+}
+
+static int64_t l_sigsuspend(uint64_t umask, uint64_t size)
+{
+    uint64_t mask;
+    if (size != 8)
+        return ZK_EINVAL;
+    if (copy_in(&mask, umask, 8))
+        return ZK_EFAULT;
+    struct proc *p = me();
+    uint64_t flags = irq_save();
+    p->sig_saved = p->sig_blocked;
+    p->sig_restore = true;
+    p->sig_blocked = mask & ~SIG_UNBLOCKABLE;
+    irq_restore(flags);
+    return wait_signal();
+}
+
+static int64_t l_sigpending(uint64_t uset, uint64_t size)
+{
+    if (size != 8)
+        return ZK_EINVAL;
+    struct proc *p = me();
+    uint64_t set = p->sig_pending & p->sig_blocked;
+    return copy_out(uset, &set, 8) ? ZK_EFAULT : 0;
+}
+
+struct l_stack_t {
+    uint64_t sp;
+    int32_t flags, pad;
+    uint64_t size;
+};
+
+static int64_t l_sigaltstack(uint64_t uss, uint64_t uold, uint64_t rsp)
+{
+    struct proc *p = me();
+    bool on = p->altstack_size && rsp > p->altstack_sp &&
+              rsp <= p->altstack_sp + p->altstack_size;
+    if (uold) {
+        struct l_stack_t o = {
+            .sp = p->altstack_sp, .size = p->altstack_size,
+            .flags = on ? SS_ONSTACK : p->altstack_flags & SS_DISABLE,
+        };
+        if (copy_out(uold, &o, sizeof o))
+            return ZK_EFAULT;
+    }
+    if (uss) {
+        struct l_stack_t n;
+        if (copy_in(&n, uss, sizeof n))
+            return ZK_EFAULT;
+        if (on)
+            return ZK_EPERM;
+        if (n.flags & ~(SS_DISABLE | (int)(1U << 31)))
+            return ZK_EINVAL;
+        if (n.flags & SS_DISABLE) {
+            p->altstack_sp = p->altstack_size = 0;
+            p->altstack_flags = SS_DISABLE;
+        } else {
+            if (n.size < 2048)
+                return -1000 - 12;    // ENOMEM, what linux says for MINSIGSTKSZ
+            p->altstack_sp = n.sp;
+            p->altstack_size = n.size;
+            p->altstack_flags = 0;
+        }
+    }
+    return 0;
 }
 
 // time and system info
@@ -1109,14 +1217,8 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 10:  return l_mprotect(A1, A2, (int)A3);
     case 11:  return l_munmap(A1, A2);
     case 12:  return l_brk(A1);
-    case 13:  return 0;    // rt_sigaction, there are no signals to deliver
-    case 14: {             // rt_sigprocmask
-        if (A3) {
-            uint64_t zero = 0;
-            return copy_out(A3, &zero, 8);
-        }
-        return 0;
-    }
+    case 13:  return l_sigaction((int)A1, A2, A3, A4);
+    case 14:  return l_sigprocmask((int)A1, A2, A3, A4);
     case 16:  return l_ioctl((int)A1, A2, A3);
     case 17:  return l_rw((int)A1, A2, A3, false, (int64_t)A4);
     case 18:  return l_rw((int)A1, A2, A3, true, (int64_t)A4);
@@ -1138,7 +1240,7 @@ static int64_t dispatch(struct interrupt_frame *f)
         return n;
     }
     case 33:  return l_dup3((int)A1, (int)A2, 0);
-    case 34:  thread_sleep_ms(1000000); return ZK_EINTR;    // pause
+    case 34:  return wait_signal();    // pause
     case 35:  return l_nanosleep(A1);
     case 37:  return 0;            // alarm
     case 38:  return 0;            // setitimer
@@ -1152,7 +1254,7 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 59:  return l_execve(A1, A2, A3);
     case 60:  proc_exit((int)(A1 & 0xff));
     case 61:  return l_wait4((int64_t)A1, A2, (int)A3, A4);
-    case 62:  return l_kill((int64_t)A1, (int)A2);
+    case 62:  return l_kill((int64_t)(int32_t)A1, (int)A2, SI_USER);
     case 63:  return l_uname(A1);
     case 72:  return l_fcntl((int)A1, (int)A2, A3);
     case 73:  return 0;            // flock
@@ -1235,7 +1337,9 @@ static int64_t dispatch(struct interrupt_frame *f)
     }
     case 121: return (int64_t)p->pgid;
     case 124: return (int64_t)p->pgid;
-    case 131: return 0;            // sigaltstack
+    case 127: return l_sigpending(A1, A2);
+    case 130: return l_sigsuspend(A1, A2);
+    case 131: return l_sigaltstack(A1, A2, f->rsp);
     case 137: {
         char path[ZK_PATH_MAX];
         int err = at_path(AT_FDCWD, A1, path, false);
@@ -1251,8 +1355,8 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 158: return l_arch_prctl((int)A1, A2);
     case 162: vfs_sync(); return 0;
     case 186: return (int64_t)p->pid;    // gettid
-    case 200:
-    case 234: return l_kill((int64_t)(f->rax == 200 ? A1 : A2), (int)(f->rax == 200 ? A2 : A3));
+    case 200: return (int32_t)A1 <= 0 ? ZK_EINVAL : l_kill((int32_t)A1, (int)A2, SI_TKILL);
+    case 234: return (int32_t)A2 <= 0 ? ZK_EINVAL : l_kill((int32_t)A2, (int)A3, SI_TKILL);
     case 201: {
         int64_t t = rtc_now();
         if (A1 && copy_out(A1, &t, sizeof t))
@@ -1308,13 +1412,20 @@ static int64_t dispatch(struct interrupt_frame *f)
 void linux_syscall(struct interrupt_frame *f)
 {
     sti();
+    int64_t nr = (int64_t)f->rax;
+    if (nr == 15) {    // rt_sigreturn puts every register back, rax too
+        signal_sigreturn(f);
+        signal_return(f, -1);
+        cli();
+        return;
+    }
     int64_t r = dispatch(f);
     // -1000 - n is linux errno n straight, for ones zos has no name for
     if (r <= -1000 && r > -1200)
         f->rax = (uint64_t)(r + 1000);
     else
         f->rax = (uint64_t)lerr(r);
-    proc_check_killed();
+    signal_return(f, nr);
     cli();
 }
 

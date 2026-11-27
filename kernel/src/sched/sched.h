@@ -49,6 +49,7 @@ struct thread {
     struct thread *next;         // run queue or wait queue
     struct thread *sleep_next;   // sleep list
     struct waitq *timed_wq;      // set while in waitq_sleep_timeout
+    struct waitq *blocked_on;    // set while in a waitq
     bool timed_out;
     struct thread *all_next;
 };
@@ -93,5 +94,8 @@ const char *thread_state_name(enum thread_state s);
 struct thread *thread_create_with(const char *name, thread_fn fn, void *arg,
                                   bool joinable, struct address_space *as,
                                   struct proc *proc);
+// interrupts must be off. wakes t early if it's blocked or sleeping, so it
+// notices a signal. callers re-check their condition, so that's safe
+void thread_interrupt(struct thread *t);
 // interrupts must be off. nobody will join t, it gets freed once dead
 void thread_detach(struct thread *t);

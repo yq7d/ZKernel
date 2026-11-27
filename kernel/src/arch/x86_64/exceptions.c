@@ -96,15 +96,39 @@ void exception_handle(struct interrupt_frame *f)
         return;
     }
 
-    // a user program crashing only takes itself down
+    // a user program crashing gets a signal, which only takes itself down
+    // unless it has a handler for it
     if ((f->cs & 3) == 3) {
         struct thread *t = thread_current();
-        kprintf("\e[1;31m%s (%lu): %s %s at %p", t->name, t->id, name, mn, (void *)f->rip);
-        if (vec == 14)
-            kprintf(", address %p", (void *)read_cr2());
-        kprintf(", killed\e[0m\n");
-        sti();
-        proc_exit(128 + (int)vec);
+        struct ksiginfo si = { .code = SI_KERNEL, .addr = f->rip };
+        int sig;
+        switch (vec) {
+        case 0:  sig = SIGFPE; si.code = FPE_INTDIV; break;
+        case 6:  sig = SIGILL; si.code = ILL_ILLOPN; break;
+        case 16:
+        case 19: sig = SIGFPE; break;
+        case 17: sig = SIGBUS; si.code = BUS_ADRERR; break;
+        case 14:
+            sig = SIGSEGV;
+            si.code = f->error_code & 1 ? SEGV_ACCERR : SEGV_MAPERR;
+            si.addr = read_cr2();
+            break;
+        default: sig = SIGSEGV; si.addr = 0; break;
+        }
+        struct proc *p = t->proc;
+        if (p && p->sigact[sig - 1].handler == SIG_DFL) {
+            kprintf("\e[1;31m%s (%lu): %s %s at %p", t->name, t->id, name, mn, (void *)f->rip);
+            if (vec == 14)
+                kprintf(", address %p", (void *)read_cr2());
+            kprintf(", killed\e[0m\n");
+        }
+        if (!p) {
+            sti();
+            proc_exit(128 + (int)vec);
+        }
+        signal_force(p, sig, &si);
+        signal_return(f, -1);
+        return;
     }
 
     panic_begin();

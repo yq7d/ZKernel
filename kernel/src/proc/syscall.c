@@ -303,7 +303,14 @@ static int64_t sys_wait(int64_t pid, uint64_t ustatus, int flags)
 {
     if (ustatus && !user_ok(ustatus, sizeof(int), true))
         return ZK_EFAULT;
-    return proc_wait(pid, (int *)ustatus, flags);
+    int status = 0;
+    int64_t r = proc_wait(pid, &status, flags);
+    if (r > 0 && ustatus) {
+        status = PROC_STATUS_CODE(status);
+        if (copy_out(ustatus, &status, sizeof status))
+            return ZK_EFAULT;
+    }
+    return r;
 }
 
 int64_t sys_pipe(uint64_t ufds)
@@ -455,7 +462,7 @@ int64_t sys_poll(uint64_t ufds, size_t n, int64_t timeout)
         }
         if (ready || timeout == 0)
             break;
-        if (me->killed) {
+        if (signal_pending(me)) {
             ready = ZK_EINTR;
             break;
         }

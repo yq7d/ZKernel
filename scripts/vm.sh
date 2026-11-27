@@ -4,7 +4,7 @@
 #   -u, --uefi        boot with ovmf
 #   -d, --debug       wait for gdb on :1234
 #   -n, --nographic   serial only, ctrl-a x to quit
-#   -m, --mem SIZE    default 512M
+#   -m, --mem SIZE    default 4G
 #   -D, --disk FILE   raw disk image as virtio-blk
 #       --no-net      no network card
 #   -c, --cpus N      default 2
@@ -14,7 +14,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ISO="$ROOT/build/zkernel.iso"
 UEFI=0 DEBUG=0 NOGRAPHIC=0 KVM=1 DISK="" NET=1
-MEM=512M CPUS=2
+MEM=4G CPUS=2
 
 while (($#)); do
     case "$1" in

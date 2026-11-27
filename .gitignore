@@ -1,3 +1,4 @@
 build/
 disk.img
 disk.vdi
+disk.img.old-*

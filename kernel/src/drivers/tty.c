@@ -43,12 +43,13 @@ void tty_input(struct tty *t, char c)
 {
     uint64_t flags = irq_save();
 
-    if ((t->mode & ZK_TTY_ISIG) && c == 3) {
-        echo(t, "^C\n", 3);
+    // ctrl+c and ctrl+\ signal the foreground job
+    if ((t->mode & ZK_TTY_ISIG) && (c == 3 || c == 0x1c)) {
+        echo(t, c == 3 ? "^C\n" : "^\\\n", 3);
         t->line_len = 0;
         t->in_count = 0;
         if (t->fg)
-            proc_kill_group(t->fg);
+            proc_signal_group(t->fg, c == 3 ? SIGINT : SIGQUIT);
         ready(t);
         irq_restore(flags);
         return;
@@ -194,7 +195,7 @@ void tty_hangup(struct tty *t)
     uint64_t flags = irq_save();
     t->hangup = true;
     if (t->fg)
-        proc_kill_group(t->fg);
+        proc_signal_group(t->fg, SIGHUP);
     ready(t);
     irq_restore(flags);
 }

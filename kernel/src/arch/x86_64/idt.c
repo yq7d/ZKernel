@@ -103,5 +103,5 @@ void interrupt_dispatch(struct interrupt_frame *frame)
     }
 
     if ((frame->cs & 3) == 3)
-        proc_check_killed();
+        signal_return(frame, -1);
 }
