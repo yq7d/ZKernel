@@ -173,6 +173,12 @@ The stuff you see on instagram reels and tiktok is not really truthful.
 ## Is it stable?
 i doubt it ever will be
 
+## Contributors
+- [yq7d](https://github.com/yq7d)
+- Devin
+- ChatGPT
+- Gemini (Antigravity)
+
 ## CONTACT INFO:
 Discord: x.monolith
 Website: https://imzire.space
