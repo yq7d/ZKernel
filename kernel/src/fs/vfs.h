@@ -150,6 +150,8 @@ size_t ramfs_bytes_used(void);
 
 // procfs.c
 extern const struct fs_type procfs_type;
+// sysfs.c
+extern const struct fs_type sysfs_type;
 
 // fat.c
 extern const struct fs_type fat_type;

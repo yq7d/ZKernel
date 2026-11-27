@@ -1,0 +1,4 @@
+Code in ZKernel that comes from other projects. Their copyright notices are
+kept in the files themselves.
+
+limine.h         Limine boot protocol header, BSD-2-Clause

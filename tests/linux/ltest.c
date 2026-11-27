@@ -773,6 +773,63 @@ static void test_devices(void)
     close(vt);
 }
 
+static int slurp(const char *path, char *buf, size_t size)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -1;
+    int n = read(fd, buf, size - 1);
+    close(fd);
+    buf[n > 0 ? n : 0] = 0;
+    return n;
+}
+
+static void test_sysfs(void)
+{
+    char buf[512];
+    CHECK(slurp("/sys/class/input/event0/dev", buf, sizeof buf) > 0 && strcmp(buf, "13:64\n") == 0);
+    CHECK(slurp("/sys/class/input/event0/device/name", buf, sizeof buf) > 0 && strstr(buf, "keyboard"));
+    CHECK(slurp("/sys/dev/char/13:65/device/capabilities/rel", buf, sizeof buf) > 0 && strcmp(buf, "103\n") == 0);
+    CHECK(slurp("/sys/class/input/input0/capabilities/ev", buf, sizeof buf) > 0 && strcmp(buf, "100003\n") == 0);
+    char real[256];
+    CHECK(realpath("/sys/class/input/event1", real) &&
+          strcmp(real, "/sys/devices/platform/i8042/serio1/input/input1/event1") == 0);
+    struct fb_var_screeninfo var;
+    int fb = open("/dev/fb0", O_RDONLY);
+    if (fb >= 0) {
+        ioctl(fb, FBIOGET_VSCREENINFO, &var);
+        close(fb);
+        unsigned w = 0, h = 0;
+        CHECK(slurp("/sys/class/graphics/fb0/virtual_size", buf, sizeof buf) > 0 &&
+              sscanf(buf, "%u,%u", &w, &h) == 2 && w == var.xres && h == var.yres);
+    }
+    DIR *d = opendir("/sys/bus/pci/devices");
+    CHECK(d != NULL);
+    int devs = 0, good = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        devs++;
+        char p[300];
+        unsigned vendor = 0;
+        unsigned char cfg[256];
+        snprintf(p, sizeof p, "/sys/bus/pci/devices/%s/vendor", e->d_name);
+        slurp(p, buf, sizeof buf);
+        sscanf(buf, "%x", &vendor);
+        snprintf(p, sizeof p, "/sys/bus/pci/devices/%s/config", e->d_name);
+        int fd = open(p, O_RDONLY);
+        if (fd >= 0 && read(fd, cfg, 256) == 256 && (cfg[0] | cfg[1] << 8) == vendor && vendor)
+            good++;
+        close(fd);
+    }
+    if (d)
+        closedir(d);
+    CHECK(devs > 0 && good == devs);
+    CHECK(slurp("/sys/devices/system/cpu/online", buf, sizeof buf) > 0 && strcmp(buf, "0\n") == 0);
+    CHECK(open("/sys/class/input/event0/dev", O_WRONLY) == -1);
+}
+
 // ltest evdev N: prints the next N events from a device, for poking by hand
 static int dump_events(const char *dev, int n)
 {
@@ -867,6 +924,7 @@ int main(int argc, char **argv)
     test_unix();
     test_events();
     test_devices();
+    test_sysfs();
 
     printf("ltest: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

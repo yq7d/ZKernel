@@ -180,3 +180,6 @@ Website: https://imzire.space
 
 side thing:
 *if you arent using A.I to assist you in 2026, youre falling behind.*
+
+## License
+GPL-2.0-only, see LICENSE. Code taken from other projects is listed in CREDITS.

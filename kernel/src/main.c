@@ -1,3 +1,4 @@
+#include "fs/sysfs.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <limine.h>
@@ -198,6 +199,8 @@ static void kmain_late(void)
         pr_ok("mouse: ps/2 ready\n");
     else
         pr_warn("mouse: none found\n");
+
+    sysfs_init();
 
     __asm__ volatile ("sti");
     pr_ok("interrupts enabled\n");

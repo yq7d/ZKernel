@@ -62,7 +62,7 @@ static int64_t lerr(int64_t r)
 
 static bool excluded(const char *path)
 {
-    static const char *const real[] = { "/dev", "/proc", "/tmp", "/home", "/mnt", "/run", LINUX_ROOT };
+    static const char *const real[] = { "/dev", "/proc", "/sys", "/tmp", "/home", "/mnt", "/run", LINUX_ROOT };
     for (size_t i = 0; i < sizeof real / sizeof real[0]; i++) {
         size_t n = strlen(real[i]);
         if (strncmp(path, real[i], n) == 0 && (path[n] == '/' || !path[n]))

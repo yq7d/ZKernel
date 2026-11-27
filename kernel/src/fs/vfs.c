@@ -118,6 +118,7 @@ void vfs_init(void)
 {
     vfs_register(&ramfs_type);
     vfs_register(&procfs_type);
+    vfs_register(&sysfs_type);
     vfs_register(&fat_type);
     vfs_register(&ext2_type);
     vfs_register(&bind_type);
