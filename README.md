@@ -98,11 +98,21 @@ x86_64, boots with Limine (BIOS and UEFI), single cpu.
 - **users:** uids, gids, groups, file permissions, set-user-id programs, `sudo`, `su`, `passwd`
 - **files:** VFS with mounts and symlinks, ramfs root unpacked from an initrd, ext2 and FAT32 (both read/write, and both can be created with `mkfs.ext2` / `mkfs.fat`), MBR and GPT partitions, bind mounts, `/proc`, `/dev`, pipes, a write-back disk cache
 - **network:** virtio-net, ARP, IPv4, ICMP, UDP, TCP, DHCP, DNS, sockets, unix domain sockets with fd passing, an HTTP client (`fetch`, `ping`, `host`, `ifconfig`)
-- **linux:** a compatibility layer for x86_64 Linux programs (around 160 syscalls), including musl's dynamic loader, signals and threads
+- **linux:** a compatibility layer for x86_64 Linux programs (around 180 syscalls), including musl's dynamic loader, signals, threads, epoll, eventfd, timerfd, signalfd, memfd, `/dev/ptmx`, evdev input (`/dev/input/event*`), Linux fbdev and VT ioctls, and a `/sys` laid out like Linux's
 - **drivers:** framebuffer console, PS/2 keyboard and mouse, serial (input and output), PIT timer, CMOS clock, PCI, ACPI power off and reset, AHCI, NVMe, virtio-blk, e1000/e1000e, virtio-net
 - **graphics and terminals:** `/dev/fb0` that programs can map, raw key and mouse events (`/dev/kbd`, `/dev/mouse`), pseudo terminals, `poll`
 - **userland:** `init`, the `zwm` desktop, `zos-install`, `pkg`, `zfetch`, a shell (`/bin/sh`) with pipes, redirects, background jobs, `;` `&&` `||`, variables, `~`, and about 70 commands: `ls cp mv rm mkdir cat grep sort head tail find df du mount ps kill sudo chmod chown`...
 - **tests:** kernel self tests run on every boot, `utest` tests the user side (malloc, fork, exec, fpu, files), `ltest` is a static glibc program that tests the Linux layer (files, fork/exec, signals, pthreads, unix sockets)
+
+## X11
+Real Xorg from Alpine runs on the framebuffer, with twm and xterm. Install it once (about 85 MB):
+
+```
+sudo pkg update
+sudo pkg install xorg-server xf86-video-fbdev xf86-input-evdev twm xterm xsetroot font-misc-misc
+```
+
+Then leave the desktop (you land in a text shell) and run `startx`. Your own `~/.xinitrc` is used if you have one. To get back, click the background and pick Exit from twm's menu. The config is in `/etc/X11/xorg.conf`.
 
 ## Building and running
 Arch: `./scripts/setup.sh` installs everything. Elsewhere you need gcc (with static glibc), nasm, ld, xorriso, limine, qemu, mtools, dosfstools, e2fsprogs and sfdisk.
