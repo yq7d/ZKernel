@@ -32,6 +32,7 @@ struct tty {
     uint64_t fg;
     struct zk_winsize ws;
     bool hangup;
+    bool onlcr;                   // output \n goes out as \r\n, linux style ptys
     struct waitq readers;
 };
 

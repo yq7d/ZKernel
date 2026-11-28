@@ -41,8 +41,14 @@ static struct vnode *pts(void)
 static size_t out_push(struct pty *p, const char *s, size_t n)
 {
     size_t done = 0;
-    while (done < n && p->count < OUT_SIZE)
+    while (done < n && p->count < OUT_SIZE) {
+        if (s[done] == '\n' && p->tty.onlcr) {
+            if (p->count + 2 > OUT_SIZE)
+                break;
+            p->out[(p->head + p->count++) % OUT_SIZE] = '\r';
+        }
         p->out[(p->head + p->count++) % OUT_SIZE] = s[done++];
+    }
     if (done) {
         waitq_wake_all(&p->out_readers);
         poll_notify();
@@ -267,6 +273,7 @@ static int ptmx_open(struct vnode *v, struct file *f)
     }
     pts_used[n / 8] |= (uint8_t)(1 << (n % 8));
     p->index = n;
+    p->tty.onlcr = true;
     vnode_put(&p->slave);    // the /dev/pts entry has it now
     f->v = &p->master;       // takes the master's first reference
     vnode_put(v);

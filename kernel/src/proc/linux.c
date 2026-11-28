@@ -499,7 +499,7 @@ static int64_t l_ioctl(int fd, unsigned long req, uint64_t arg)
         struct termios2 tio;
         memset(&tio, 0, sizeof tio);
         tio.iflag = 0002400;    // ICRNL | IXON
-        tio.oflag = 0000005;    // OPOST | ONLCR
+        tio.oflag = t == &console_tty || t->onlcr ? 0000005 : 0;    // OPOST | ONLCR
         tio.cflag = 0000277;    // CS8 | CREAD | B38400
         tio.lflag = 0000060;    // ECHOE | ECHOK
         if (t->mode & ZK_TTY_CANON)
@@ -532,6 +532,8 @@ static int64_t l_ioctl(int fd, unsigned long req, uint64_t arg)
         if (tio.lflag & L_ISIG)
             mode |= ZK_TTY_ISIG;
         t->mode = mode;
+        if (t != &console_tty)
+            t->onlcr = (tio.oflag & 5) == 5;
         return 0;
     }
     case 0x5413:    // TIOCGWINSZ
