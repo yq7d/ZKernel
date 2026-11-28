@@ -347,8 +347,9 @@ static int run_script(const char *path, const char *text, size_t size, char **ar
 
     // scripts from linux packages mean the linux tree's interpreter
     char ipath[ZK_PATH_MAX];
-    size_t rl = strlen(LINUX_ROOT);
-    if (strncmp(path, LINUX_ROOT, rl) == 0 && path[rl] == '/')
+    size_t rl = strlen(LINUX_ROOT), al = strlen(APPS_ROOT);
+    if ((strncmp(path, LINUX_ROOT, rl) == 0 && path[rl] == '/') ||
+        (strncmp(path, APPS_ROOT, al) == 0 && path[al] == '/'))
         linux_resolve(interp, ipath, false);
     else
         strlcpy(ipath, interp, sizeof ipath);

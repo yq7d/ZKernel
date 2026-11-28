@@ -104,15 +104,10 @@ x86_64, boots with Limine (BIOS and UEFI), single cpu.
 - **userland:** `init`, the `zwm` desktop, `zos-install`, `pkg`, `zfetch`, a shell (`/bin/sh`) with pipes, redirects, background jobs, `;` `&&` `||`, variables, `~`, and about 70 commands: `ls cp mv rm mkdir cat grep sort head tail find df du mount ps kill sudo chmod chown`...
 - **tests:** kernel self tests run on every boot, `utest` tests the user side (malloc, fork, exec, fpu, files), `ltest` is a static glibc program that tests the Linux layer (files, fork/exec, signals, pthreads, unix sockets)
 
-## X11
-Real Xorg from Alpine runs on the framebuffer, with twm and xterm. Install it once (about 85 MB):
+## X11 and bundled apps
+The ISO carries Xorg, twm, xterm and Firefox from Alpine as a read only image (`/compat/apps`, loaded into RAM, about 500 MB), so it boots straight into X with nothing to download. Give the VM 2 GB or more. `make` downloads the packages once into `.cache/apk`. Change the list with `make APPS="..."`, or leave them out with `make APPS=` (then `sudo pkg install xorg-server xf86-video-fbdev xf86-input-evdev twm xterm` gets X onto the disk instead). `zwm` on the kernel command line boots the ZOS desktop instead of X.
 
-```
-sudo pkg update
-sudo pkg install xorg-server xf86-video-fbdev xf86-input-evdev twm xterm xsetroot font-misc-misc
-```
-
-Then leave the desktop (you land in a text shell) and run `startx`. Your own `~/.xinitrc` is used if you have one. To get back, click the background and pick Exit from twm's menu. The config is in `/etc/X11/xorg.conf`.
+From a text shell, `startx` starts X. Your own `~/.xinitrc` is used if you have one. To get back, click the background and pick Exit from twm's menu. The config is in `/etc/X11/xorg.conf`.
 
 ## Building and running
 Arch: `./scripts/setup.sh` installs everything. Elsewhere you need gcc (with static glibc), nasm, ld, xorriso, limine, qemu, mtools, dosfstools, e2fsprogs and sfdisk.

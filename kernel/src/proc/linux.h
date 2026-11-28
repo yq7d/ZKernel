@@ -8,6 +8,8 @@
 #include <stdint.h>
 
 #define LINUX_ROOT "/compat/linux"
+// the read only programs bundled in the iso, tried after LINUX_ROOT
+#define APPS_ROOT  "/compat/apps"
 
 void linux_init(void);
 // absolute normalized path in, the path a linux program means out (ZK_PATH_MAX)

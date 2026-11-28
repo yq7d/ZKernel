@@ -99,6 +99,8 @@ static uint64_t boot_stack;
 static uint64_t rsdp_phys;
 static const void *initrd_data;
 static size_t initrd_size;
+static const void *apps_data;
+static size_t apps_size;
 
 static void find_initrd(void)
 {
@@ -111,8 +113,44 @@ static void find_initrd(void)
         if (strcmp(slash ? slash + 1 : path, "initrd.tar") == 0) {
             initrd_data = r->modules[i]->address;
             initrd_size = r->modules[i]->size;
+        } else if (strcmp(slash ? slash + 1 : path, "apps.img") == 0) {
+            apps_data = r->modules[i]->address;
+            apps_size = r->modules[i]->size;
         }
     }
+}
+
+// apps.img from the iso: a read only ext2 image in memory, the bundled
+// linux programs. linux programs look in /compat/apps after /compat/linux
+static int ram_read(struct blkdev *d, uint64_t lba, uint32_t count, void *buf)
+{
+    if ((lba + count) * SECTOR_SIZE > d->sectors * SECTOR_SIZE)
+        return ZK_EIO;
+    memcpy(buf, (const uint8_t *)d->priv + lba * SECTOR_SIZE, (size_t)count * SECTOR_SIZE);
+    return 0;
+}
+
+static int ram_write(struct blkdev *d, uint64_t lba, uint32_t count, const void *buf)
+{
+    (void)d; (void)lba; (void)count; (void)buf;
+    return ZK_EROFS;
+}
+
+static void mount_apps(void)
+{
+    if (!apps_data)
+        return;
+    static struct blkdev ram = { .name = "ram0", .read = ram_read, .write = ram_write,
+                                 .model = "bundled apps" };
+    ram.sectors = apps_size / SECTOR_SIZE;
+    ram.priv = (void *)apps_data;
+    blk_register(&ram);
+    vfs_mkdir("/compat");
+    vfs_mkdir("/compat/apps");
+    if (vfs_mount("/dev/ram0", "/compat/apps", "ext2", "ro") == 0)
+        pr_ok("apps: %zu MiB of bundled programs on /compat/apps\n", apps_size >> 20);
+    else
+        pr_warn("apps: can't mount apps.img\n");
 }
 
 // runs /bin/sh (or init=) on the console, falling back to the kernel shell
@@ -210,6 +248,7 @@ static void kmain_late(void)
     ahci_init();
     nvme_init();
     blk_start_flusher();
+    mount_apps();
 
     pr_info("running self-tests...\n");
     bool ok = test_string() & test_printf() & test_mm() & test_timer() & test_sched() & test_vfs() & test_proc();

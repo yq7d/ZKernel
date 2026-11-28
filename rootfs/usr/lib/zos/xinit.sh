@@ -2,6 +2,8 @@
 # run by startx: X on /dev/fb0, then ~/.xinitrc, or twm with an xterm.
 # leaving the window manager (twm: click the background, Exit) ends X
 export DISPLAY=:0
+# linux paths first, they resolve into /compat/linux or the bundled apps
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 mkdir -p /tmp/.X11-unix
 Xorg :0 -nolisten tcp -noreset -logfile /tmp/Xorg.0.log vt1 >/tmp/Xorg.out 2>&1 &
 xpid=$!

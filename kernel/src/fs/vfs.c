@@ -369,6 +369,19 @@ static int lookup_parent(const char *path, struct vnode **dir, char *name);
 
 #define MAX_LINKS 16
 #define COMPAT_ROOT "/compat/linux"
+#define APPS_ROOT   "/compat/apps"
+
+// the linux tree a path is in, "" outside both
+static const char *compat_of(const char *path)
+{
+    static const char *const roots[] = { COMPAT_ROOT, APPS_ROOT };
+    for (int i = 0; i < 2; i++) {
+        size_t n = strlen(roots[i]);
+        if (strncmp(path, roots[i], n) == 0 && (path[n] == '/' || !path[n]))
+            return roots[i];
+    }
+    return "";
+}
 
 static int read_link(struct vnode *v, char *buf, size_t size)
 {
@@ -455,10 +468,8 @@ restart:;
             if (err)
                 goto out;
             // rebuild the path: where we are, the link's target, what's left
-            bool in_compat = strncmp(done, COMPAT_ROOT "/", sizeof COMPAT_ROOT) == 0 ||
-                             strcmp(done, COMPAT_ROOT) == 0;
             if (target[0] == '/')
-                snprintf(tmp, ZK_PATH_MAX, "%s%s/%s", in_compat ? COMPAT_ROOT : "", target, rest);
+                snprintf(tmp, ZK_PATH_MAX, "%s%s/%s", compat_of(done), target, rest);
             else
                 snprintf(tmp, ZK_PATH_MAX, "%s/%s/%s", done, target, rest);
             err = vfs_normalize("/", tmp, todo);

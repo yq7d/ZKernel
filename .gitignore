@@ -3,3 +3,4 @@ disk.img
 disk.vdi
 disk.img.old-*
 disk-*.img
+.cache/

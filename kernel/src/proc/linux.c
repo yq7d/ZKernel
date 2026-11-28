@@ -65,7 +65,7 @@ static int64_t lerr(int64_t r)
 
 static bool excluded(const char *path)
 {
-    static const char *const real[] = { "/dev", "/proc", "/sys", "/tmp", "/home", "/mnt", "/run", LINUX_ROOT };
+    static const char *const real[] = { "/dev", "/proc", "/sys", "/tmp", "/home", "/mnt", "/run", LINUX_ROOT, APPS_ROOT };
     for (size_t i = 0; i < sizeof real / sizeof real[0]; i++) {
         size_t n = strlen(real[i]);
         if (strncmp(path, real[i], n) == 0 && (path[n] == '/' || !path[n]))
@@ -86,6 +86,13 @@ void linux_resolve(const char *path, char *out, bool creating)
     if (vfs_lookup_nofollow(alt, &v) == 0) {
         vnode_put(v);
         strlcpy(out, alt, ZK_PATH_MAX);
+        return;
+    }
+    char apps[ZK_PATH_MAX];
+    if (snprintf(apps, sizeof apps, APPS_ROOT "%s", path) < (int)sizeof apps &&
+        vfs_lookup_nofollow(apps, &v) == 0) {
+        vnode_put(v);
+        strlcpy(out, apps, ZK_PATH_MAX);
         return;
     }
     if (!creating)

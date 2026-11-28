@@ -103,7 +103,7 @@ static void setup_user(void)
 
 int main(void)
 {
-    setenv("PATH", "/bin:/usr/local/bin:/compat/linux/bin:/compat/linux/usr/bin", 1);
+    setenv("PATH", "/bin:/usr/local/bin:/compat/linux/bin:/compat/linux/usr/bin:/compat/apps/bin:/compat/apps/usr/bin", 1);
     struct zk_stat st;
     if (stat("/etc/rc", &st) == 0) {
         char *rc[] = { "/bin/sh", "/etc/rc", NULL };
@@ -147,7 +147,8 @@ int main(void)
     }
     // x with twm once xorg is installed, "zwm" on the command line keeps zwm
     struct zk_stat xst;
-    bool use_x = !want_zwm && stat("/compat/linux/usr/bin/Xorg", &xst) == 0;
+    bool use_x = !want_zwm && (stat("/compat/linux/usr/bin/Xorg", &xst) == 0 ||
+                               stat("/compat/apps/usr/bin/Xorg", &xst) == 0);
     for (;;) {
         if (gui && use_x) {
             uint64_t began = uptime_ms();

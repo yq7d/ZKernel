@@ -6,6 +6,9 @@
 # make disk       fresh disk image (wipes the old one): 64 MiB fat, the rest ext2
 # make clean      everything but the disk image
 #
+# bundled linux programs, in the iso as a read only image on /compat/apps.
+# downloaded once into .cache/apk. make APPS= leaves them out
+#
 # kernel cmdline: make run KCMDLINE="fault=pf"
 #   init=/bin/init (default, the desktop), init=/bin/sh for text only,
 #   init=kshell for the built in kernel shell
@@ -59,6 +62,10 @@ USER_LIB     := $(BUILD)/user/lib/crt0.asm.o $(BUILD)/user/lib/zk.o $(BUILD)/use
 
 DISK := disk.img
 
+APPS ?= xorg-server xf86-video-fbdev xf86-input-evdev twm xterm xsetroot xeyes \
+        font-misc-misc font-dejavu firefox ca-certificates
+APPS_IMG := $(if $(strip $(APPS)),$(BUILD)/apps.img)
+
 .PHONY: all run run-uefi vbox debug clean disk FORCE
 all: $(ISO) $(DISK)
 
@@ -83,7 +90,8 @@ disk:
 # only rewritten when the output changes, so the iso rebuilds on cmdline change
 $(BUILD)/limine.conf: limine.conf FORCE
 	@mkdir -p $(BUILD)
-	@sed 's|@CMDLINE@|$(KCMDLINE)|' $< > $@.tmp
+	@sed -e 's|@CMDLINE@|$(KCMDLINE)|' \
+	     -e '$(if $(APPS_IMG),s|^\(.*\)module_path: boot():/boot/initrd.tar|&\n\1module_path: boot():/boot/apps.img|)' $< > $@.tmp
 	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
 
 $(BUILD)/%.o: %.c
@@ -149,11 +157,21 @@ $(INITRD): $(USER_BINS) $(ROOTFS_FILES) kernel/fonts/ter-v16n.psf $(LTEST) $(KER
 $(KERNEL): $(OBJS) kernel/linker.ld
 	$(LD) $(LDFLAGS) $(OBJS) -o $@
 
-$(ISO): $(KERNEL) $(INITRD) $(BUILD)/limine.conf
+# the package list is remembered so changing APPS rebuilds the image
+$(BUILD)/apps.list: FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(strip $(APPS))' > $@.tmp
+	@cmp -s $@.tmp $@ && rm $@.tmp || mv $@.tmp $@
+
+$(BUILD)/apps.img: $(BUILD)/apps.list scripts/mkapps.py
+	python3 scripts/mkapps.py $@ .cache/apk $(APPS)
+
+$(ISO): $(KERNEL) $(INITRD) $(BUILD)/limine.conf $(APPS_IMG)
 	rm -rf $(BUILD)/iso_root
 	mkdir -p $(BUILD)/iso_root/boot/limine $(BUILD)/iso_root/EFI/BOOT
 	cp $(KERNEL) $(BUILD)/iso_root/boot/zkernel
 	cp $(INITRD) $(BUILD)/iso_root/boot/initrd.tar
+	$(if $(APPS_IMG),cp $(APPS_IMG) $(BUILD)/iso_root/boot/apps.img)
 	cp $(BUILD)/limine.conf $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(BUILD)/iso_root/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(BUILD)/iso_root/EFI/BOOT/
