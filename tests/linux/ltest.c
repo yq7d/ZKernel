@@ -773,6 +773,33 @@ static void test_devices(void)
     close(vt);
 }
 
+static void test_pty(void)
+{
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    CHECK(m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0);
+    char *name = ptsname(m) ? strdup(ptsname(m)) : NULL;
+    CHECK(name && strncmp(name, "/dev/pts/", 9) == 0);
+    int s = name ? open(name, O_RDWR | O_NOCTTY) : -1;
+    CHECK(s >= 0 && isatty(s));
+    char buf[16] = { 0 };
+    CHECK(write(s, "hey", 3) == 3 && read(m, buf, sizeof buf) >= 3 && memcmp(buf, "hey", 3) == 0);
+    struct winsize ws = { .ws_row = 30, .ws_col = 100 };
+    CHECK(ioctl(m, TIOCSWINSZ, &ws) == 0);
+    memset(&ws, 0, sizeof ws);
+    CHECK(ioctl(s, TIOCGWINSZ, &ws) == 0 && ws.ws_col == 100);
+    int m2 = posix_openpt(O_RDWR);
+    char *n2 = m2 >= 0 && ptsname(m2) ? strdup(ptsname(m2)) : NULL;
+    CHECK(n2 && name && strcmp(n2, name) != 0);
+    close(m2);
+    struct stat st;
+    CHECK(n2 && stat(n2, &st) == -1);    // gone with its master
+    free(n2);
+    close(s);
+    CHECK(name && stat(name, &st) == 0);     // the slave is still open
+    close(m);
+    free(name);
+}
+
 static int slurp(const char *path, char *buf, size_t size)
 {
     int fd = open(path, O_RDONLY);
@@ -925,6 +952,7 @@ int main(int argc, char **argv)
     test_events();
     test_devices();
     test_sysfs();
+    test_pty();
 
     printf("ltest: %d passed, %d failed\n", passed, failed);
     return failed ? 1 : 0;

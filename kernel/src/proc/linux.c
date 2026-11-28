@@ -5,6 +5,8 @@
 #include "proc/proc.h"
 #include "proc/futex.h"
 #include "proc/lfd.h"
+#include "cmdline.h"
+#include "kprintf.h"
 #include "console/console.h"
 #include "fs/shmem.h"
 #include "proc/sys.h"
@@ -470,6 +472,26 @@ static int64_t l_ioctl(int fd, unsigned long req, uint64_t arg)
     if (t && (req >> 8) == 0x56)
         return vt_ioctl(req, arg);
     switch (req) {
+    case 0x80045430: {  // TIOCGPTN
+        int32_t n = pty_index(f->v);
+        return n < 0 ? ZK_ENOTTY : copy_out(arg, &n, 4);
+    }
+    case 0x40045431:    // TIOCSPTLCK, never locked
+        return pty_index(f->v) < 0 ? ZK_ENOTTY : 0;
+    case 0x5441: {      // TIOCGPTPEER
+        struct vnode *sv = pty_slave(f->v);
+        if (!sv)
+            return ZK_ENOTTY;
+        struct file *sf = file_new(sv, O_RDWR | ((int)arg & O_NONBLOCK));
+        if (!sf)
+            return ZK_ENOMEM;
+        int nfd = proc_fd_alloc(me(), sf);
+        if (nfd < 0)
+            file_put(sf);
+        else if (arg & 02000000)    // O_CLOEXEC
+            proc_set_cloexec(me(), nfd, true);
+        return nfd;
+    }
     case 0x5401:        // TCGETS
     case 0x802C542A: {  // TCGETS2, termios plus two speeds
         if (!t)
@@ -1474,7 +1496,7 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 12:  return l_brk(A1);
     case 13:  return l_sigaction((int)A1, A2, A3, A4);
     case 14:  return l_sigprocmask((int)A1, A2, A3, A4);
-    case 16:  return l_ioctl((int)A1, A2, A3);
+    case 16:  return l_ioctl((int)A1, (uint32_t)A2, A3);    // musl sign extends it
     case 17:  return l_rw((int)A1, A2, A3, false, (int64_t)A4);
     case 18:  return l_rw((int)A1, A2, A3, true, (int64_t)A4);
     case 19:  return l_rwv((int)A1, A2, (int)A3, false, -1);
@@ -1708,6 +1730,9 @@ static int64_t dispatch(struct interrupt_frame *f)
     return ZK_ENOSYS;
 }
 
+// ltrace=name on the kernel command line: failing syscalls of that program
+static char trace_name[32];
+
 void linux_syscall(struct interrupt_frame *f)
 {
     sti();
@@ -1718,7 +1743,11 @@ void linux_syscall(struct interrupt_frame *f)
         cli();
         return;
     }
+    uint64_t a1 = f->rdi, a2 = f->rsi, a3 = f->rdx;
     int64_t r = dispatch(f);
+    if (trace_name[0] && r < 0 && r != ZK_EAGAIN && strcmp(thread_current()->name, trace_name) == 0)
+        kprintf("ltrace %s[%lu]: %ld(%lx, %lx, %lx) = %ld\n", trace_name, me()->pid, nr,
+                a1, a2, a3, r);
     // -1000 - n is linux errno n straight, for ones zos has no name for
     if (r <= -1000 && r > -1200)
         f->rax = (uint64_t)(r + 1000);
@@ -1730,6 +1759,7 @@ void linux_syscall(struct interrupt_frame *f)
 
 void linux_init(void)
 {
+    cmdline_get("ltrace", trace_name, sizeof trace_name);
     // syscall lands on kernel cs 0x08, sysret would use 0x10 + 16 = user cs 0x23
     wrmsr(MSR_STAR, (0x10UL << 48) | (0x08UL << 32));
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);

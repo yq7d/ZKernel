@@ -5,6 +5,7 @@
 #include "drivers/tty.h"
 #include "mm/heap.h"
 #include "proc/proc.h"
+#include "lib/printf.h"
 
 #define OUT_SIZE 8192
 
@@ -14,8 +15,27 @@ struct pty {
     size_t head, count;
     struct waitq out_readers, out_writers;
     bool master_open, slave_open;
+    int index;                 // /dev/pts/N for ptmx ones, -1 otherwise
     struct vnode master, slave;
 };
+
+#define MAX_PTS 256
+static uint8_t pts_used[MAX_PTS / 8];
+
+static struct vnode *pts_dir;
+
+static void pts_name(char *buf, size_t size, int n)
+{
+    snprintf(buf, size, "%d", n);
+}
+
+// /dev/pts entries are the kernel's to make and remove, whoever opened ptmx
+static struct vnode *pts(void)
+{
+    if (!pts_dir && vfs_lookup("/dev/pts", &pts_dir))
+        pts_dir = NULL;
+    return pts_dir;
+}
 
 // interrupts off. returns how much fit
 static size_t out_push(struct pty *p, const char *s, size_t n)
@@ -125,6 +145,14 @@ static int m_ioctl(struct vnode *v, struct file *f, unsigned long req, uint64_t 
 static void m_release(struct vnode *v)
 {
     struct pty *p = v->priv;
+    if (p->index >= 0) {
+        char name[32];
+        pts_name(name, sizeof name, p->index);
+        if (pts())
+            pts()->ops->unlink(pts(), name);
+        pts_used[p->index / 8] &= (uint8_t)~(1 << (p->index % 8));
+        p->index = -1;
+    }
     tty_hangup(&p->tty);
     uint64_t flags = irq_save();
     p->master_open = false;
@@ -190,17 +218,69 @@ struct tty *tty_of(struct vnode *v)
     return NULL;
 }
 
-int pty_create(struct file **master, struct file **slave)
+static struct pty *pty_new(void)
 {
     struct pty *p = kzalloc(sizeof(*p));
     if (!p)
-        return ZK_ENOMEM;
+        return NULL;
     tty_init(&p->tty, &pty_tty_ops, p);
     p->master_open = p->slave_open = true;
+    p->index = -1;
     p->master = (struct vnode){ .type = VNODE_DEV, .refs = 1, .ino = vfs_next_ino(),
-                                .ops = &master_ops, .priv = p };
+                                .ops = &master_ops, .priv = p, .mode = 0620 };
     p->slave = (struct vnode){ .type = VNODE_DEV, .refs = 1, .ino = vfs_next_ino(),
-                               .ops = &slave_ops, .priv = p };
+                               .ops = &slave_ops, .priv = p, .mode = 0620 };
+    return p;
+}
+
+int pty_index(struct vnode *v)
+{
+    return v->ops == &master_ops ? ((struct pty *)v->priv)->index : -1;
+}
+
+struct vnode *pty_slave(struct vnode *master)
+{
+    return master->ops == &master_ops ? &((struct pty *)master->priv)->slave : NULL;
+}
+
+// /dev/ptmx: every open makes a pty, the file becomes its master and the
+// slave shows up as /dev/pts/N until the master is closed
+static int ptmx_open(struct vnode *v, struct file *f)
+{
+    int n = 0;
+    while (n < MAX_PTS && (pts_used[n / 8] & (1 << (n % 8))))
+        n++;
+    if (n == MAX_PTS)
+        return ZK_ENOSPC;
+    struct pty *p = pty_new();
+    if (!p)
+        return ZK_ENOMEM;
+    const struct zk_cred *c = cred_current();
+    p->slave.uid = c->euid;
+    p->slave.gid = 5;    // tty
+    char name[32];
+    pts_name(name, sizeof name, n);
+    int err = pts() ? pts()->ops->link(pts(), name, &p->slave) : ZK_ENOENT;
+    if (err) {
+        kfree(p);
+        return err;
+    }
+    pts_used[n / 8] |= (uint8_t)(1 << (n % 8));
+    p->index = n;
+    vnode_put(&p->slave);    // the /dev/pts entry has it now
+    f->v = &p->master;       // takes the master's first reference
+    vnode_put(v);
+    return 0;
+}
+
+static const struct vnode_ops ptmx_ops = { .open = ptmx_open };
+struct vnode ptmx_vnode = { .type = VNODE_DEV, .refs = 1, .ops = &ptmx_ops };
+
+int pty_create(struct file **master, struct file **slave)
+{
+    struct pty *p = pty_new();
+    if (!p)
+        return ZK_ENOMEM;
 
     // the files take their own refs, then ours go away
     *master = file_new(&p->master, O_RDWR);

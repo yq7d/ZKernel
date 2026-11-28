@@ -169,6 +169,10 @@ int pipe_create(struct file **rd, struct file **wr);
 
 // pty.c, rd is the master side
 int pty_create(struct file **master, struct file **slave);
+// /dev/ptmx, and the pts number of a master (-1 for anything else)
+extern struct vnode ptmx_vnode;
+int pty_index(struct vnode *v);
+struct vnode *pty_slave(struct vnode *master);
 
 // wakes poll() sleepers, call whenever something may have become readable
 void poll_notify(void);

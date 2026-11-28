@@ -68,6 +68,9 @@ void dev_init(void)
     add("/dev/mouse", &mouse_vnode, 0660, 20, 10, 201);
     add("/dev/fb0", &fb_vnode, 0660, 21, 29, 0);
 
+    vfs_mkdir("/dev/pts");
+    add("/dev/ptmx", &ptmx_vnode, 0666, 0, 5, 2);
+
     // linux names: input devices and vts, every vt is the console
     evdev_init();
     vfs_mkdir("/dev/input");
