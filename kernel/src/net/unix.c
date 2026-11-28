@@ -448,6 +448,10 @@ static int take_fds(uint64_t control, uint64_t clen, struct seg *g)
             int n = (int)((h.len - 16) / 4);
             if (n > MAX_FDS_PER_MSG || g->nfds + n > MAX_FDS_PER_MSG)
                 return ZK_EINVAL;
+            if (n == 0) {    // allowed, and kmalloc(0) is NULL
+                at += (h.len + 7) & ~7UL;
+                continue;
+            }
             struct file **fds = kmalloc(sizeof(*fds) * (size_t)(g->nfds + n));
             if (!fds)
                 return ZK_ENOMEM;

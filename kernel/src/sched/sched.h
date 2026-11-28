@@ -45,6 +45,7 @@ struct thread {
     struct proc *proc;           // NULL for kernel threads
     struct fpu_state *fpu;
     uint64_t fs_base;            // thread pointer, for tls
+    uint64_t gs_base;            // the program's own, the kernel doesn't use gs
 
     struct thread *next;         // run queue or wait queue
     struct thread *sleep_next;   // sleep list

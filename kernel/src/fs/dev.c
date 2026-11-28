@@ -69,6 +69,10 @@ void dev_init(void)
     add("/dev/fb0", &fb_vnode, 0660, 21, 29, 0);
 
     vfs_mkdir("/dev/pts");
+    // posix shared memory, anyone's. memory files, so shared mappings share
+    vfs_mkdir("/dev/shm");
+    if (vfs_mount("shm", "/dev/shm", "tmpfs", "mode=1777,shm=1"))
+        pr_warn("dev: can't mount /dev/shm\n");
     add("/dev/ptmx", &ptmx_vnode, 0666, 0, 5, 2);
 
     // linux names: input devices and vts, every vt is the console

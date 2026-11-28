@@ -11,11 +11,39 @@
 
 #define MAX_PAGES (1UL << 20)    // 4 GiB
 
+#define SEAL_SEAL   1
+#define SEAL_SHRINK 2
+#define SEAL_GROW   4
+#define SEAL_WRITE  8
+#define SEAL_FUTURE_WRITE 0x10
+
 struct shmem {
     struct vnode v;
     uint64_t *pages;
     size_t cap;
+    uint32_t seals;    // linux's F_SEAL_* bits
 };
+
+int shmem_add_seals(struct vnode *v, uint32_t seals)
+{
+    struct shmem *s = (struct shmem *)v;
+    if (seals & ~0x1FU)
+        return ZK_EINVAL;
+    if (s->seals & SEAL_SEAL)
+        return ZK_EPERM;
+    s->seals |= seals;
+    return 0;
+}
+
+uint32_t shmem_seals(struct vnode *v)
+{
+    return ((struct shmem *)v)->seals;
+}
+
+void shmem_allow_sealing(struct vnode *v)
+{
+    ((struct shmem *)v)->seals &= ~SEAL_SEAL;
+}
 
 static const struct vnode_ops shmem_ops;
 
@@ -84,6 +112,11 @@ static int64_t sh_read(struct vnode *v, void *buf, size_t len, uint64_t off)
 
 static int64_t sh_write(struct vnode *v, const void *buf, size_t len, uint64_t off)
 {
+    struct shmem *sm = (struct shmem *)v;
+    if (sm->seals & (SEAL_WRITE | SEAL_FUTURE_WRITE))
+        return ZK_EPERM;
+    if (off + len > v->size && (sm->seals & SEAL_GROW))
+        return ZK_EPERM;
     size_t done = 0;
     while (done < len) {
         uint64_t pos = off + done;
@@ -103,6 +136,8 @@ static int64_t sh_write(struct vnode *v, const void *buf, size_t len, uint64_t o
 static int sh_truncate(struct vnode *v, uint64_t size)
 {
     struct shmem *s = (struct shmem *)v;
+    if ((size < v->size && (s->seals & SEAL_SHRINK)) || (size > v->size && (s->seals & SEAL_GROW)))
+        return ZK_EPERM;
     if (size / PAGE_SIZE > MAX_PAGES)
         return ZK_EFBIG;
     uint64_t irq = irq_save();
@@ -134,8 +169,17 @@ static void sh_release(struct vnode *v)
     kfree(s);
 }
 
+static int sh_setattr(struct vnode *v, uint32_t uid, uint32_t gid, uint32_t mode)
+{
+    v->uid = uid;
+    v->gid = gid;
+    v->mode = mode & 07777;
+    return 0;
+}
+
 static const struct vnode_ops shmem_ops = {
     .read = sh_read, .write = sh_write, .truncate = sh_truncate, .release = sh_release,
+    .setattr = sh_setattr,
 };
 
 struct vnode *shmem_new(uint64_t size)
@@ -143,6 +187,9 @@ struct vnode *shmem_new(uint64_t size)
     struct shmem *s = kzalloc(sizeof(*s));
     if (!s)
         return NULL;
+    // like linux: only memfd_create with MFD_ALLOW_SEALING starts unsealed,
+    // /dev/shm files and the rest can't be sealed at all
+    s->seals = SEAL_SEAL;
     s->v = (struct vnode){ .type = VNODE_FILE, .refs = 1, .ino = vfs_next_ino(),
                            .mode = 0600, .ops = &shmem_ops, .size = size };
     return &s->v;

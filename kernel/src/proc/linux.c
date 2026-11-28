@@ -250,12 +250,68 @@ static void set_ctty(struct proc *p, struct vnode *v)
         vnode_put(old);
 }
 
+// the fd number in /proc/self/fd/N, /proc/<our pid>/fd/N or /dev/fd/N, else -1
+static int self_fd_path(const char *path)
+{
+    const char *p = NULL;
+    if (strncmp(path, "/proc/self/fd/", 14) == 0) {
+        p = path + 14;
+    } else if (strncmp(path, "/dev/fd/", 8) == 0) {
+        p = path + 8;
+    } else if (strncmp(path, "/proc/", 6) == 0) {
+        uint64_t pid = 0;
+        const char *q = path + 6;
+        while (*q >= '0' && *q <= '9')
+            pid = pid * 10 + (uint64_t)(*q++ - '0');
+        if (q > path + 6 && pid == me()->pid && strncmp(q, "/fd/", 4) == 0)
+            p = q + 4;
+    }
+    if (!p || !*p)
+        return -1;
+    int fd = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9' || fd > 100000)
+            return -1;
+        fd = fd * 10 + (*p - '0');
+    }
+    return fd;
+}
+
+// opening /proc/self/fd/N opens N's file again, with the new access mode
+static int64_t reopen_fd(int n, int flags)
+{
+    struct file *old = fd_file(n);
+    if (!old)
+        return ZK_ENOENT;
+    int acc = flags & O_ACCMODE;
+    if (acc != O_RDONLY && vfs_permission(old->v, MAY_WRITE))
+        return ZK_EACCES;
+    if (acc != O_WRONLY && vfs_permission(old->v, MAY_READ))
+        return ZK_EACCES;
+    struct file *f = file_new(old->v, acc | (flags & (O_APPEND | O_NONBLOCK)));
+    if (!f)
+        return ZK_ENOMEM;
+    if ((flags & O_TRUNC) && acc != O_RDONLY)
+        vfs_truncate(f->v, 0);
+    int fd = proc_fd_alloc(me(), f);
+    if (fd < 0) {
+        file_put(f);
+        return fd;
+    }
+    if (flags & O_CLOEXEC)
+        proc_set_cloexec(me(), fd, true);
+    return fd;
+}
+
 static int64_t l_openat(int dirfd, uint64_t upath, int flags, uint32_t mode)
 {
     char path[ZK_PATH_MAX];
     int err = at_path(dirfd, upath, path, flags & O_CREAT);
     if (err)
         return err;
+    int self = self_fd_path(path);
+    if (self >= 0)
+        return reopen_fd(self, flags);
     struct zk_stat st;
     bool existed = vfs_stat(path, &st) == 0;
     struct file *f;
@@ -322,6 +378,27 @@ static int64_t l_rw(int fd, uint64_t buf, size_t len, bool write, int64_t off)
 struct iovec {
     uint64_t base, len;
 };
+
+// space for a file: only growing it (mode 0) or nothing at all (keep size)
+static int64_t l_fallocate(int fd, int mode, int64_t off, int64_t len)
+{
+    struct file *f = fd_file(fd);
+    if (!f)
+        return ZK_EBADF;
+    if (off < 0 || len <= 0)
+        return ZK_EINVAL;
+    if (f->v->type != VNODE_FILE)
+        return ZK_ENODEV;
+    if ((f->flags & O_ACCMODE) == O_RDONLY)
+        return ZK_EBADF;
+    if (mode == 1)    // FALLOC_FL_KEEP_SIZE
+        return 0;
+    if (mode != 0)
+        return -1000 - 95;    // EOPNOTSUPP, punching holes and the like
+    if ((uint64_t)(off + len) > f->v->size)
+        return vfs_truncate(f->v, (uint64_t)(off + len));
+    return 0;
+}
 
 static int64_t l_rwv(int fd, uint64_t uiov, int cnt, bool write, int64_t off)
 {
@@ -640,10 +717,10 @@ static int64_t l_fcntl(int fd, int cmd, uint64_t arg)
         f->flags = (f->flags & ~(O_APPEND | O_NONBLOCK)) | ((int)arg & (O_APPEND | O_NONBLOCK));
         sock_set_nonblock(f->v, arg & O_NONBLOCK);
         return 0;
-    case 1033:      // F_ADD_SEALS, nothing is enforced
-        return 0;
+    case 1033:      // F_ADD_SEALS
+        return shmem_is(f->v) ? shmem_add_seals(f->v, (uint32_t)arg) : ZK_EINVAL;
     case 1034:      // F_GET_SEALS
-        return 0;
+        return shmem_is(f->v) ? (int64_t)shmem_seals(f->v) : ZK_EINVAL;
     default:        // locks and the rest: nothing else runs at the same time anyway
         return 0;
     }
@@ -751,7 +828,7 @@ static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, 
     }
 
     // ordinary files fill in on first touch, from the page cache
-    if (f && f->v->type == VNODE_FILE) {
+    if (f && f->v->type == VNODE_FILE && !shmem_is(f->v)) {
         int err = filemap_add(as, start, len, f->v, off, prot & 7, f->path);
         return err ? err : (int64_t)start;
     }
@@ -809,6 +886,8 @@ static int64_t l_memfd_create(uint64_t uname, unsigned flags)
         file_put(f);
         return fd;
     }
+    if (flags & 2)    // MFD_ALLOW_SEALING
+        shmem_allow_sealing(v);
     if (flags & MFD_CLOEXEC)
         proc_set_cloexec(me(), fd, true);
     return fd;
@@ -868,6 +947,40 @@ static int64_t l_brk(uint64_t want)
 }
 
 // processes
+
+// waitid: exits only (WEXITED), by pid or any child, siginfo filled in
+static int64_t l_waitid(int idtype, int64_t id, uint64_t uinfo, int options)
+{
+    if (idtype == 3)          // P_PIDFD, there are no pidfds
+        return ZK_EINVAL;
+    if (idtype == 2)          // P_PGID, close enough: any child
+        idtype = 0;
+    if (!(options & 4))       // WEXITED, stopped and continued children never come
+        return ZK_EINVAL;
+    int code = 0;
+    int flags = (options & 1 ? WNOHANG : 0) | (options & 0x01000000 ? PROC_WNOWAIT : 0);
+    int64_t r = proc_wait(idtype == 1 ? id : -1, &code, flags);
+    if (r < 0)
+        return r;
+    if (uinfo) {
+        // siginfo_t: signo, errno, code, then pid, uid, status at 16, 20, 24
+        uint8_t si[128] = { 0 };
+        if (r > 0) {
+            int sig = PROC_STATUS_SIG(code);
+            int32_t v = 17;    // SIGCHLD
+            memcpy(si, &v, 4);
+            v = sig ? (PROC_STATUS_CORE(code) ? 3 : 2) : 1;    // CLD_DUMPED, KILLED, EXITED
+            memcpy(si + 8, &v, 4);
+            v = (int32_t)r;
+            memcpy(si + 16, &v, 4);
+            v = sig ? sig : (code & 0xff);
+            memcpy(si + 24, &v, 4);
+        }
+        if (copy_out(uinfo, si, sizeof si))
+            return ZK_EFAULT;
+    }
+    return 0;
+}
 
 static int64_t l_wait4(int64_t pid, uint64_t ustatus, int options, uint64_t urusage)
 {
@@ -1484,6 +1597,15 @@ static int64_t l_arch_prctl(int code, uint64_t addr)
     }
     if (code == 0x1003)      // ARCH_GET_FS
         return copy_out(addr, &t->fs_base, sizeof t->fs_base);
+    if (code == 0x1001) {    // ARCH_SET_GS, firefox's wasm sandboxes keep their memory base there
+        if (addr >= USER_LIMIT)
+            return ZK_EPERM;
+        t->gs_base = addr;
+        wrmsr(MSR_GS_BASE, addr);
+        return 0;
+    }
+    if (code == 0x1004)      // ARCH_GET_GS
+        return copy_out(addr, &t->gs_base, sizeof t->gs_base);
     return ZK_EINVAL;
 }
 
@@ -1544,6 +1666,11 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 18:  return l_rw((int)A1, A2, A3, true, (int64_t)A4);
     case 19:  return l_rwv((int)A1, A2, (int)A3, false, -1);
     case 20:  return l_rwv((int)A1, A2, (int)A3, true, -1);
+    case 295: return l_rwv((int)A1, A2, (int)A3, false, (int64_t)A4);    // preadv
+    case 296: return l_rwv((int)A1, A2, (int)A3, true, (int64_t)A4);     // pwritev
+    case 327: return l_rwv((int)A1, A2, (int)A3, false, (int64_t)A4);    // preadv2, -1 is the file position
+    case 328: return l_rwv((int)A1, A2, (int)A3, true, (int64_t)A4);     // pwritev2
+    case 285: return l_fallocate((int)A1, (int)A2, (int64_t)A3, (int64_t)A4);
     case 21:  return l_access(AT_FDCWD, A1, (int)A2);
     case 22:  return sys_pipe(A1);
     case 24:  thread_yield(); return 0;
@@ -1582,6 +1709,7 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 59:  return l_execve(A1, A2, A3);
     case 60:  proc_thread_exit((int)(A1 & 0xff));
     case 61:  return l_wait4((int64_t)A1, A2, (int)A3, A4);
+    case 247: return l_waitid((int)A1, (int64_t)A2, A3, (int)A4);
     case 62:  return l_kill((int64_t)(int32_t)A1, (int)A2, SI_USER);
     case 63:  return l_uname(A1);
     case 72:  return l_fcntl((int)A1, (int)A2, A3);

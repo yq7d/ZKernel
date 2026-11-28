@@ -123,6 +123,8 @@ static void schedule(void)
     fpu_restore(next->fpu);
     if (prev->fs_base != next->fs_base)
         wrmsr(MSR_FS_BASE, next->fs_base);
+    if (prev->gs_base != next->gs_base)
+        wrmsr(MSR_GS_BASE, next->gs_base);
     switch_context(&prev->rsp, next->rsp);
 }
 

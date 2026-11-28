@@ -18,7 +18,7 @@ while [ $i -lt 40 ] && ! xsetroot -solid steelblue 2>/dev/null; do
 done
 if [ -n "$ZOS_XAPP" ]; then
     # one program from xrun, the session ends with it
-    twm &
+    twm -f /usr/lib/zos/twmrc &
     # kept for after: the program's output and how it ended
     $ZOS_XAPP >/tmp/xapp.log 2>&1
     echo "exited with status $?" >>/tmp/xapp.log
@@ -26,7 +26,7 @@ elif [ -f "$HOME/.xinitrc" ]; then
     sh "$HOME/.xinitrc"
 else
     xterm -geometry 80x24+40+40 &
-    twm
+    twm -f /usr/lib/zos/twmrc
 fi
 kill $xpid 2>/dev/null
 wait $xpid 2>/dev/null

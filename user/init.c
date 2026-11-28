@@ -141,6 +141,18 @@ int main(void)
     }
     setup_user();
 
+    // dbus and glib want a machine id. a new one each boot, nothing about
+    // this machine sticks around
+    uint8_t id[16];
+    getrandom(id, sizeof id);
+    int mfd = open("/etc/machine-id", O_WRONLY | O_CREAT | O_TRUNC);
+    if (mfd >= 0) {
+        for (int i = 0; i < 16; i++)
+            dprintf(mfd, "%02x", id[i]);
+        dprintf(mfd, "\n");
+        close(mfd);
+    }
+
     char *zwm[] = { "/bin/zwm", NULL };
     char *x11[] = { "/bin/startx", NULL };
     char *shell[] = { "/bin/sh", NULL };

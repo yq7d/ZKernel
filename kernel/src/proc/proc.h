@@ -123,6 +123,7 @@ __attribute__((noreturn)) void proc_exit_signal(int sig, bool core);
 // status is the exit code, with the signal it died from in bits 16-23
 // and 1 << 24 if it dumped core
 int64_t proc_wait(int64_t pid, int *status, int flags);
+#define PROC_WNOWAIT 0x100    // proc_wait flag: don't reap
 #define PROC_STATUS_SIG(s)  (((s) >> 16) & 0xff)
 #define PROC_STATUS_CORE(s) (((s) >> 24) & 1)
 #define PROC_STATUS_CODE(s) ((s) & 0xffff)

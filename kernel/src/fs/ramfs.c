@@ -1,5 +1,6 @@
 // in-memory filesystem, the root of the tree
 #include "fs/vfs.h"
+#include "fs/shmem.h"
 #include "lib/string.h"
 #include "drivers/rtc.h"
 #include "mm/heap.h"
@@ -21,6 +22,7 @@ struct rnode {
     size_t cap;
     struct entry *entries;
     bool dead;    // dir was unlinked
+    bool shm;     // files made here are memory files: /dev/shm, mapped shared for real
 };
 
 static struct mutex lock = MUTEX_INIT;
@@ -169,7 +171,25 @@ static int add_entry(struct rnode *dir, const char *name, struct vnode *v)
 
 static int create(struct vnode *dir, const char *name, enum vnode_type type, struct vnode **out)
 {
+    if (RNODE(dir)->shm && type == VNODE_FILE) {
+        struct vnode *v = shmem_new(0);
+        if (!v)
+            return ZK_ENOMEM;
+        v->mtime = rtc_now();
+        v->mode = 0644;
+        mutex_lock(&lock);
+        int err = add_entry(RNODE(dir), name, v);
+        mutex_unlock(&lock);
+        if (err) {
+            vnode_put(v);
+            return err;
+        }
+        *out = v;
+        return 0;
+    }
     struct rnode *r = new_node(type);
+    if (r && type == VNODE_DIR)
+        r->shm = RNODE(dir)->shm;
     if (!r)
         return ZK_ENOMEM;
     mutex_lock(&lock);
@@ -354,6 +374,9 @@ static int ramfs_mount(struct mount *m, const char *source, const char *opts)
     mount_opt(opts, "mode", &r->v.mode, 8);
     mount_opt(opts, "uid", &r->v.uid, 10);
     mount_opt(opts, "gid", &r->v.gid, 10);
+    uint32_t shm = 0;
+    mount_opt(opts, "shm", &shm, 10);
+    r->shm = shm != 0;
     m->root = &r->v;
     m->statfs = ramfs_statfs;
     return 0;

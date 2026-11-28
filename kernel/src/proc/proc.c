@@ -503,6 +503,7 @@ static struct thread *start_proc(struct proc *p, const char *name, thread_fn fn,
         if (copy_fpu) {
             fpu_save(t->fpu);    // the caller's user state, the kernel never touches it
             t->fs_base = thread_current()->fs_base;
+            t->gs_base = thread_current()->gs_base;
         }
     }
     irq_restore(flags);
@@ -676,6 +677,8 @@ int proc_exec(const char *path, char **argv, char **envp, void *release)
     t->clear_tid = 0;
     t->fs_base = 0;
     wrmsr(MSR_FS_BASE, 0);
+    t->gs_base = 0;
+    wrmsr(MSR_GS_BASE, 0);
 
     // past this point there's no going back
     uint64_t flags = irq_save();
@@ -777,6 +780,7 @@ int64_t proc_clone_thread(struct interrupt_frame *frame, uint64_t flags, uint64_
     t->extra = true;
     fpu_save(t->fpu);    // the caller's user state
     t->fs_base = (flags & CLONE_SETTLS) ? tls : cur->fs_base;
+    t->gs_base = cur->gs_base;
     t->sig_blocked = cur->sig_blocked;
     t->altstack_flags = SS_DISABLE;
     if (flags & CLONE_CHILD_CLEARTID)
@@ -978,6 +982,12 @@ int64_t proc_wait(int64_t pid, int *status, int flags)
         if (found) {
             int64_t id = (int64_t)found->pid;
             int extra = found->death_sig << 16 | (found->core ? 1 << 24 : 0);
+            if (flags & PROC_WNOWAIT) {    // look, but leave it to be waited for
+                if (status)
+                    *status = (found->thread->exit_code & 0xffff) | extra;
+                irq_restore(flags_irq);
+                return id;
+            }
             found->parent = NULL;
             irq_restore(flags_irq);
             int code = thread_join(found->thread);    // frees found

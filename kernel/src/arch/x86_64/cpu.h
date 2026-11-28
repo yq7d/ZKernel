@@ -34,6 +34,7 @@ static inline void irq_restore(uint64_t flags)
 #define MSR_LSTAR      0xC0000082
 #define MSR_SFMASK     0xC0000084
 #define MSR_FS_BASE    0xC0000100
+#define MSR_GS_BASE    0xC0000101
 #define MSR_PAT        0x277
 
 static inline uint64_t rdmsr(uint32_t msr)
