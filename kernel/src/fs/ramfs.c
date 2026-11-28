@@ -7,7 +7,7 @@
 #include "mm/pmm.h"
 #include "sched/sync.h"
 
-#define MAX_FILE_SIZE (64UL << 20)
+#define MAX_FILE_SIZE (256UL << 20)
 
 struct entry {
     char name[ZK_NAME_MAX + 1];

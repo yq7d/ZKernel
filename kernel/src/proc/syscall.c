@@ -17,7 +17,7 @@
 #include "sched/sched.h"
 #include <zk/syscall.h>
 
-#define MAX_ALLOC_PAGES (64 * 1024)
+#define MAX_ALLOC_PAGES (1024 * 1024)    // 4 GiB, memory runs out first
 #define MAX_PS          64
 
 static struct address_space *cur_as(void)
