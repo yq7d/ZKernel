@@ -5,3 +5,5 @@
 // takes the controllers over from the firmware and starts the usb thread.
 // true if there was at least one
 bool xhci_init(void);
+// from the timer irq
+void xhci_tick(void);

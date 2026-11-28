@@ -32,6 +32,24 @@ static long start(char **argv, bool as_user)
     return pid;
 }
 
+// what xrun left for an x session, taken out of the way
+static bool x_request(char *app, size_t size)
+{
+    int fd = open("/tmp/.zos-xsession", O_RDONLY);
+    if (fd < 0)
+        return false;
+    long n = read(fd, app, size - 1);
+    close(fd);
+    unlink("/tmp/.zos-xsession");
+    if (n <= 0)
+        return false;
+    app[n] = '\0';
+    char *nl = strchr(app, '\n');
+    if (nl)
+        *nl = '\0';
+    return app[0] != '\0';
+}
+
 static int run(char **argv, bool as_user)
 {
     long pid = start(argv, as_user);
@@ -161,6 +179,14 @@ int main(void)
         if (gui && !use_x) {
             uint64_t began = uptime_ms();
             int status = run(zwm, true);
+            // xrun closed zwm to run an x program: x for it, then zwm again
+            char app[1024];
+            if (x_request(app, sizeof app)) {
+                setenv("ZOS_XAPP", app, 1);
+                run(x11, true);
+                unsetenv("ZOS_XAPP");
+                continue;
+            }
             // it couldn't even start, no point trying again
             if (status != 0 && uptime_ms() - began < 3000) {
                 printf("init: the desktop failed to start, using the text console\n");

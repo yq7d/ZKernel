@@ -107,7 +107,9 @@ x86_64, boots with Limine (BIOS and UEFI), single cpu.
 ## X11 and bundled apps
 The ISO carries Xorg, twm, xterm and Firefox from Alpine as a read only image (`/compat/apps`, loaded into RAM, about 500 MB), so it boots straight into X with nothing to download. Give the VM 2 GB or more. `make` downloads the packages once into `.cache/apk`. Change the list with `make APPS="..."`, or leave them out with `make APPS=` (then `sudo pkg install xorg-server xf86-video-fbdev xf86-input-evdev twm xterm` gets X onto the disk instead). `zwm` on the kernel command line boots the ZOS desktop instead of X.
 
-From a text shell, `startx` starts X. Your own `~/.xinitrc` is used if you have one. To get back, click the background and pick Exit from twm's menu. The config is in `/etc/X11/xorg.conf`.
+From a text shell, `startx` starts X. Typing `firefox` (or `xrun <program>`) in the ZOS desktop switches to X with that program and comes back to the desktop when it closes.
+
+Booted from a USB stick, ZOS works like Tails: it all runs from RAM, and pulling the stick out wipes RAM and powers off. `nowipe` on the kernel command line turns that off. Your own `~/.xinitrc` is used if you have one. To get back, click the background and pick Exit from twm's menu. The config is in `/etc/X11/xorg.conf`.
 
 ## Building and running
 Arch: `./scripts/setup.sh` installs everything. Elsewhere you need gcc (with static glibc), nasm, ld, xorriso, limine, qemu, mtools, dosfstools, e2fsprogs and sfdisk.

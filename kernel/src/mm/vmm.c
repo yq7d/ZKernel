@@ -137,11 +137,10 @@ void vmm_unmap(uint64_t virt)
 }
 
 // uses 2MiB pages where the range allows it
-static void map_hhdm_range(uint64_t base, uint64_t length)
+static void map_hhdm_range(uint64_t base, uint64_t length, uint64_t flags)
 {
     uint64_t phys = ALIGN_DOWN(base, PAGE_SIZE);
     uint64_t end = ALIGN_UP(base + length, PAGE_SIZE);
-    uint64_t flags = PTE_WRITE | PTE_NX;
 
     while (phys < end) {
         uint64_t virt = phys + hhdm_offset;
@@ -170,6 +169,10 @@ static void map_kernel_range(char *start, char *end, uint64_t flags,
 void vmm_init(struct limine_memmap_response *memmap,
               uint64_t kernel_phys, uint64_t kernel_virt)
 {
+    // pat entry 1 (pwt alone) becomes write combining, for the framebuffer.
+    // uncached it's slow enough on real hardware to watch it draw
+    wrmsr(MSR_PAT, (rdmsr(MSR_PAT) & ~0xFF00UL) | (0x01UL << 8));
+
     kernel_pml4_phys = pmm_alloc_zeroed();
     if (!kernel_pml4_phys)
         panic("vmm: no memory for the pml4");
@@ -184,7 +187,8 @@ void vmm_init(struct limine_memmap_response *memmap,
         struct limine_memmap_entry *e = memmap->entries[i];
         if (e->type == LIMINE_MEMMAP_RESERVED || e->type == LIMINE_MEMMAP_BAD_MEMORY)
             continue;
-        map_hhdm_range(e->base, e->length);
+        map_hhdm_range(e->base, e->length, PTE_WRITE | PTE_NX |
+                       (e->type == LIMINE_MEMMAP_FRAMEBUFFER ? PTE_WC : 0));
     }
 
     map_kernel_range(__kernel_start, __text_start, PTE_WRITE | PTE_NX, kernel_phys, kernel_virt);
@@ -560,6 +564,28 @@ bool vmm_cow_fault(struct address_space *as, uint64_t addr)
         invlpg(virt);
     spin_unlock_irqrestore(&lock, irq);
     return true;
+}
+
+static void tables_of(uint64_t phys, int level, uint64_t *out, size_t max, size_t *n, int from)
+{
+    if (*n < max)
+        out[(*n)++] = phys;
+    if (level == 1)
+        return;
+    uint64_t *t = phys_to_virt(phys);
+    for (int i = from; i < 512; i++) {
+        uint64_t e = t[i];
+        if (!(e & PTE_PRESENT) || (e & PTE_HUGE))
+            continue;
+        tables_of(e & PTE_ADDR_MASK, level - 1, out, max, n, 0);
+    }
+}
+
+size_t vmm_kernel_tables(uint64_t *out, size_t max)
+{
+    size_t n = 0;
+    tables_of(kernel_pml4_phys, 4, out, max, &n, 256);
+    return n;
 }
 
 void vmm_activate(struct address_space *as)

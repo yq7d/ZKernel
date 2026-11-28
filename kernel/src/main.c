@@ -1,3 +1,4 @@
+#include "arch/x86_64/power.h"
 #include "drivers/xhci.h"
 #include "fs/sysfs.h"
 #include <stdint.h>
@@ -75,6 +76,12 @@ static volatile struct limine_executable_address_request kaddr_request = {
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_module_request module_request = {
     .id = LIMINE_MODULE_REQUEST_ID,
+    .revision = 0,
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_executable_file_request kfile_request = {
+    .id = LIMINE_EXECUTABLE_FILE_REQUEST_ID,
     .revision = 0,
 };
 
@@ -322,6 +329,14 @@ void kmain(void)
     heap_init();
     pr_ok("heap: ready at %p\n", (void *)HEAP_BASE);
     find_initrd();
+    // booted off a usb stick or disk rather than a cd: unplugging it wipes
+    // ram and powers off, unless "nowipe". read now, limine's memory is
+    // reclaimed later
+    struct limine_executable_file_response *kf = kfile_request.response;
+    char nowipe[4];
+    wipe_arm(kf && kf->executable_file &&
+             kf->executable_file->media_type == LIMINE_MEDIA_TYPE_GENERIC &&
+             !cmdline_get("nowipe", nowipe, sizeof nowipe));
     // the response sits in memory that's about to be reclaimed
     if (rsdp_request.response) {
         // older protocol revisions hand out an hhdm address, newer a physical one

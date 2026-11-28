@@ -18,6 +18,17 @@ static size_t free_pages;
 static size_t next_hint;
 static spinlock_t lock = SPINLOCK_INIT;
 
+// every range of ram pages are handed out from, for pmm_wipe
+#define MAX_RAM_RANGES 128
+static struct { uint64_t base, end; } ram[MAX_RAM_RANGES];
+static size_t nram;
+
+static void note_ram(uint64_t base, uint64_t length)
+{
+    if (nram < MAX_RAM_RANGES)
+        ram[nram++] = (typeof(ram[0])){ ALIGN_UP(base, PAGE_SIZE), ALIGN_DOWN(base + length, PAGE_SIZE) };
+}
+
 static inline bool page_used(size_t i)  { return bitmap[i / 8] & (1 << (i % 8)); }
 static inline void mark_used(size_t i)  { bitmap[i / 8] |= (uint8_t)(1 << (i % 8)); }
 static inline void mark_free(size_t i)  { bitmap[i / 8] &= (uint8_t)~(1 << (i % 8)); }
@@ -48,6 +59,9 @@ void pmm_init(struct limine_memmap_response *memmap)
     }
 
     page_count = top / PAGE_SIZE;
+    for (uint64_t i = 0; i < memmap->entry_count; i++)
+        if (memmap->entries[i]->type == LIMINE_MEMMAP_USABLE)
+            note_ram(memmap->entries[i]->base, memmap->entries[i]->length);
     size_t bitmap_bytes = ALIGN_UP((page_count + 7) / 8, 16);
     size_t bitmap_size = ALIGN_UP(bitmap_bytes + page_count * sizeof(uint16_t), PAGE_SIZE);
 
@@ -193,8 +207,10 @@ size_t pmm_reclaim_bootloader(struct limine_memmap_response *memmap)
     size_t r = 0;
     for (uint64_t i = 0; i < memmap->entry_count; i++) {
         struct limine_memmap_entry *e = memmap->entries[i];
-        if (e->type == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE)
+        if (e->type == LIMINE_MEMMAP_BOOTLOADER_RECLAIMABLE) {
             ranges[r++] = (struct range){ e->base, e->length };
+            note_ram(e->base, e->length);
+        }
     }
 
     size_t reclaimed = 0;
@@ -215,6 +231,34 @@ size_t pmm_reclaim_bootloader(struct limine_memmap_response *memmap)
 
     kfree(ranges);
     return reclaimed;
+}
+
+static bool skipped(const uint64_t *skip, size_t n, uint64_t p)
+{
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        if (skip[mid] == p)
+            return true;
+        if (skip[mid] < p)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return false;
+}
+
+void pmm_wipe(const uint64_t *skip, size_t nskip)
+{
+    for (size_t r = 0; r < nram; r++) {
+        for (uint64_t p = ram[r].base; p < ram[r].end; p += PAGE_SIZE) {
+            if (skipped(skip, nskip, p))
+                continue;
+            void *v = phys_to_virt(p);
+            uint64_t cnt = PAGE_SIZE / 8;
+            __asm__ volatile ("rep stosq" : "+D"(v), "+c"(cnt) : "a"(0UL) : "memory");
+        }
+    }
 }
 
 size_t pmm_total_pages(void)

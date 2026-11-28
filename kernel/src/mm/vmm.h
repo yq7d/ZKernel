@@ -10,6 +10,7 @@ struct limine_memmap_response;
 #define PTE_USER    (1UL << 2)
 #define PTE_PWT     (1UL << 3)
 #define PTE_PCD     (1UL << 4)
+#define PTE_WC      PTE_PWT      // pat entry 1, set up as write combining
 #define PTE_HUGE    (1UL << 7)
 #define PTE_GLOBAL  (1UL << 8)
 #define PTE_COW     (1UL << 9)    // available bit: read only until written, then copied
@@ -66,3 +67,5 @@ struct address_space *vmm_clone_space(struct address_space *src);
 bool vmm_cow_fault(struct address_space *as, uint64_t addr);
 // NULL switches back to the kernel-only tables
 void vmm_activate(struct address_space *as);
+// the pages of the kernel's own page tables, upper half and the pml4
+size_t vmm_kernel_tables(uint64_t *out, size_t max);

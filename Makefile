@@ -51,7 +51,7 @@ USER_PROGS   := hello spin fault guess sh ls cat echo mkdir rm wc ps kill utest 
                 uptime free clear date df mount umount sync reboot poweroff which \
                 env pwd hostname du find xargs printf init zwm \
                 id whoami sudo su passwd chmod chown ifconfig ping host fetch pkg zfetch \
-                mkfs.fat mkfs.ext2 zos-install startx
+                mkfs.fat mkfs.ext2 zos-install startx xrun
 USER_BINS    := $(USER_PROGS:%=$(BUILD)/user/%.elf)
 USER_LIB     := $(BUILD)/user/lib/crt0.asm.o $(BUILD)/user/lib/zk.o $(BUILD)/user/lib/malloc.o $(BUILD)/user/lib/env.o $(BUILD)/user/lib/util.o \
                 $(BUILD)/user/lib/sha256.o $(BUILD)/user/lib/users.o $(BUILD)/user/lib/net.o \
@@ -140,6 +140,7 @@ $(INITRD): $(USER_BINS) $(ROOTFS_FILES) kernel/fonts/ter-v16n.psf $(LTEST) $(KER
 	    cp -a $(ALPINE_ROOT)/. $(BUILD)/rootfs/compat/linux/; fi
 	mkdir -p $(BUILD)/rootfs/usr/lib/zos
 	cp $(LTEST) $(BUILD)/rootfs/usr/lib/zos/ltest
+	ln -sf xrun $(BUILD)/rootfs/bin/firefox
 	ln -sf zfetch $(BUILD)/rootfs/bin/neofetch
 	ln -sf zfetch $(BUILD)/rootfs/bin/fastfetch
 	chmod 4755 $(BUILD)/rootfs/bin/sudo $(BUILD)/rootfs/bin/su $(BUILD)/rootfs/bin/passwd

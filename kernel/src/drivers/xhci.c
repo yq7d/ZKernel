@@ -11,6 +11,7 @@
 #include "drivers/pci.h"
 #include "drivers/pit.h"
 #include "kprintf.h"
+#include "arch/x86_64/power.h"
 #include "lib/string.h"
 #include "mm/heap.h"
 #include "mm/mm.h"
@@ -64,6 +65,22 @@ struct ring {
 
 struct hc;
 
+#define MAX_HID 4
+
+// one boot protocol interface of a device and its interrupt endpoint
+struct hid {
+    int kind;               // 1 keyboard, 2 mouse
+    int iface, dci;
+    uint16_t mps;
+    uint8_t binterval;
+    struct ring in;
+    uint8_t *buf;           // report buffer, one page
+    uint64_t buf_phys;
+    uint8_t last[8];        // previous keyboard report
+    uint64_t repeat_at;     // typematic repeat for the last key pressed
+    uint8_t repeat_key;
+};
+
 struct dev {
     struct hc *hc;
     int slot, port, speed;  // port: on the root hub
@@ -72,19 +89,16 @@ struct dev {
     int tt_slot, tt_port;   // the high speed hub a low/full speed device hangs off
     int hub_ports;          // nonzero for hubs
     bool hub_ss;            // a usb 3 hub
+    struct dev *parent;     // the hub it's on, NULL on a root port
+    int hub_port;
+    bool boot_media;        // usb storage there at boot: the live stick
     uint32_t hub_attached;  // bit per hub port with a device on it
     uint8_t hub_tries[16];
     struct ring ep0;
-    struct ring in;         // the hid interrupt endpoint
-    int in_dci;
-    int kind;               // 1 keyboard, 2 mouse
-    uint8_t *buf;           // report buffer, one page
+    uint8_t *buf;           // control transfers, one page
     uint64_t buf_phys;
-    uint16_t in_mps;
-    uint8_t last[8];        // previous keyboard report
-    uint64_t repeat_at;     // typematic repeat for the last key pressed
-    uint8_t repeat_key;
-    bool waiting;           // a transfer is queued on the interrupt ring
+    struct hid *hid[MAX_HID];   // wireless receivers have a keyboard and a mouse
+    int nhid;
 };
 
 struct hc {
@@ -106,6 +120,7 @@ struct hc {
 
 static struct hc *hcs[MAX_HC];
 static int nhc;
+static uint64_t boot_window;    // storage attached before this is the boot stick
 
 static uint32_t rd32(volatile uint8_t *b, uint32_t off) { return *(volatile uint32_t *)(b + off); }
 static void wr32(volatile uint8_t *b, uint32_t off, uint32_t v) { *(volatile uint32_t *)(b + off) = v; }
@@ -200,7 +215,7 @@ static bool has(const uint8_t *keys, uint8_t k)
     return false;
 }
 
-static void keyboard_report(struct dev *d, const uint8_t *r)
+static void keyboard_report(struct hid *d, const uint8_t *r)
 {
     if (r[2] == 1)
         return;    // rollover error, nothing in it is real
@@ -228,7 +243,7 @@ static void keyboard_report(struct dev *d, const uint8_t *r)
 }
 
 // usb keyboards leave repeating to the host
-static void keyboard_repeat(struct dev *d)
+static void keyboard_repeat(struct hid *d)
 {
     if (!d->repeat_key || timer_uptime_ms() < d->repeat_at)
         return;
@@ -238,11 +253,10 @@ static void keyboard_repeat(struct dev *d)
 
 // events
 
-static void queue_in(struct dev *d)
+static void queue_in(struct dev *d, struct hid *x)
 {
-    ring_push(&d->in, d->buf_phys, d->in_mps, (TRB_NORMAL << 10) | TRB_IOC);
-    d->waiting = true;
-    ring_doorbell(d->hc, d->slot, (uint32_t)d->in_dci);
+    ring_push(&x->in, x->buf_phys, x->mps, (TRB_NORMAL << 10) | TRB_IOC);
+    ring_doorbell(d->hc, d->slot, (uint32_t)x->dci);
 }
 
 static void handle_event(struct hc *h, struct trb *e)
@@ -262,18 +276,20 @@ static void handle_event(struct hc *h, struct trb *e)
             h->xfer_code = code;
             return;
         }
-        if ((int)dci != d->in_dci)
+        struct hid *x = NULL;
+        for (int i = 0; i < d->nhid; i++)
+            if (d->hid[i]->dci == (int)dci)
+                x = d->hid[i];
+        if (!x)
             return;
-        d->waiting = false;
         if (code == 1 || code == 13) {    // success, short packet
-            size_t got = d->in_mps - (e->status & 0xFFFFFF);
-            if (d->kind == 1 && got >= 8)
-                keyboard_report(d, d->buf);
-            else if (d->kind == 2 && got >= 3)
-                mouse_report((int8_t)d->buf[1], (int8_t)d->buf[2], d->buf[0] & 7);
+            size_t got = x->mps - (e->status & 0xFFFFFF);
+            if (x->kind == 1 && got >= 8)
+                keyboard_report(x, x->buf);
+            else if (x->kind == 2 && got >= 3)
+                mouse_report((int8_t)x->buf[1], (int8_t)x->buf[2], x->buf[0] & 7);
+            queue_in(d, x);
         }
-        if (code == 1 || code == 13)
-            queue_in(d);
     }
     // port changes are picked up by the scan in the thread
 }
@@ -368,75 +384,133 @@ static int interval(int speed, uint8_t b)
     return n;
 }
 
+// every boot keyboard and mouse interface on the device, all their
+// endpoints configured at once. false if it has none
 static bool setup_hid(struct dev *d, const uint8_t *cfg, size_t len)
 {
     struct hc *h = d->hc;
-    int iface = -1, kind = 0, ep = 0;
-    uint16_t mps = 8;
-    uint8_t binterval = 10;
+    struct hid *cur = NULL;
     for (size_t off = 0; off + 2 <= len && cfg[off] >= 2; off += cfg[off]) {
         const uint8_t *x = cfg + off;
         if (x[1] == 4 && off + 9 <= len) {    // interface
-            if (kind && ep)
-                break;
-            kind = 0;
-            if (x[5] == 3 && x[6] == 1 && (x[7] == 1 || x[7] == 2)) {
-                iface = x[2];
-                kind = x[7];
+            cur = NULL;
+            if (x[3] == 0 && x[5] == 3 && x[6] == 1 && (x[7] == 1 || x[7] == 2) &&
+                d->nhid < MAX_HID) {
+                cur = kzalloc(sizeof *cur);
+                if (cur) {
+                    cur->iface = x[2];
+                    cur->kind = x[7];
+                }
             }
-        } else if (x[1] == 5 && kind && !ep && off + 7 <= len) {    // endpoint
+        } else if (x[1] == 5 && cur && off + 7 <= len) {    // endpoint
             if ((x[2] & 0x80) && (x[3] & 3) == 3) {
-                ep = x[2] & 15;
-                mps = (uint16_t)((x[4] | x[5] << 8) & 0x7FF);
-                binterval = x[6];
+                cur->dci = (x[2] & 15) * 2 + 1;
+                cur->mps = (uint16_t)((x[4] | x[5] << 8) & 0x7FF);
+                cur->binterval = x[6];
+                if (cur->mps < 8)
+                    cur->mps = 8;
+                d->hid[d->nhid++] = cur;
+                cur = NULL;
             }
         }
     }
-    if (!kind || !ep)
+    if (cur)
+        kfree(cur);
+    if (!d->nhid)
         return false;
 
-    uint8_t cfgval = cfg[5];
-    if (!control(d, 0x00, 9, cfgval, 0, 0, 0)) {    // set configuration
+    if (!control(d, 0x00, 9, cfg[5], 0, 0, 0)) {    // set configuration
         pr_warn("usb: port %d: set configuration failed\n", d->port);
+        d->nhid = 0;
         return true;
     }
-    control(d, 0x21, 0x0B, 0, (uint16_t)iface, 0, 0);    // set protocol: boot
-    control(d, 0x21, 0x0A, 0, (uint16_t)iface, 0, 0);    // set idle
-
-    if (!ring_init(&d->in))
-        return true;
-    d->in_dci = ep * 2 + 1;
-    d->in_mps = mps < 8 ? 8 : mps;
-    d->kind = kind;
 
     uint64_t inphys;
     void *input = dma_page(&inphys);
     if (!input)
         return true;
     uint32_t *icc = ctx(h, input, 0);
-    icc[1] = 1U | (1U << d->in_dci);    // add slot and the endpoint
     uint32_t *slot = ctx(h, input, 1);
-    uint64_t outphys = h->dcbaa[d->slot];
-    memcpy(slot, ctx(h, phys_to_virt(outphys), 0), (size_t)h->csz);
-    slot[0] = (slot[0] & ~(31U << 27)) | ((uint32_t)d->in_dci << 27);
-    uint32_t *e = ctx(h, input, 1 + d->in_dci);
-    e[0] = (uint32_t)interval(d->speed, binterval) << 16;
-    e[1] = (3U << 1) | (7U << 3) | ((uint32_t)mps << 16);    // cerr 3, interrupt in
-    e[2] = (uint32_t)d->in.phys | 1;
-    e[3] = (uint32_t)(d->in.phys >> 32);
-    e[4] = mps | ((uint32_t)mps << 16);
-    bool ok = command(h, inphys, (TRB_CONFIGURE << 10) | ((uint32_t)d->slot << 24), NULL);
+    memcpy(slot, ctx(h, phys_to_virt(h->dcbaa[d->slot]), 0), (size_t)h->csz);
+    icc[1] = 1;
+    int last = 1;
+    int ok_hid = 0;
+    for (int i = 0; i < d->nhid; i++) {
+        struct hid *x = d->hid[i];
+        control(d, 0x21, 0x0B, 0, (uint16_t)x->iface, 0, 0);    // set protocol: boot
+        control(d, 0x21, 0x0A, 0, (uint16_t)x->iface, 0, 0);    // set idle
+        if (!ring_init(&x->in) || !(x->buf = dma_page(&x->buf_phys)))
+            continue;
+        icc[1] |= 1U << x->dci;
+        if (x->dci > last)
+            last = x->dci;
+        uint32_t *e = ctx(h, input, 1 + x->dci);
+        e[0] = (uint32_t)interval(d->speed, x->binterval) << 16;
+        e[1] = (3U << 1) | (7U << 3) | ((uint32_t)x->mps << 16);    // cerr 3, interrupt in
+        e[2] = (uint32_t)x->in.phys | 1;
+        e[3] = (uint32_t)(x->in.phys >> 32);
+        e[4] = x->mps | ((uint32_t)x->mps << 16);
+        ok_hid++;
+    }
+    slot[0] = (slot[0] & ~(31U << 27)) | ((uint32_t)last << 27);
+    bool ok = ok_hid && command(h, inphys, (TRB_CONFIGURE << 10) | ((uint32_t)d->slot << 24), NULL);
     pmm_free(inphys);
     if (!ok) {
         pr_warn("usb: port %d: configure endpoint failed\n", d->port);
+        d->nhid = 0;
         return true;
     }
-    pr_ok("usb: %s on port %d\n", kind == 1 ? "keyboard" : "mouse", d->port);
-    queue_in(d);
+    for (int i = 0; i < d->nhid; i++) {
+        struct hid *x = d->hid[i];
+        if (!x->buf)
+            continue;
+        pr_ok("usb: %s on port %d\n", x->kind == 1 ? "keyboard" : "mouse", d->port);
+        queue_in(d, x);
+    }
     return true;
 }
 
 static void scan_hub(struct dev *hub);
+
+// a device and everything behind it went away
+static void detach(struct hc *h, struct dev *d)
+{
+    for (int s = 1; s <= h->slots; s++)
+        if (h->devs[s] && h->devs[s]->parent == d)
+            detach(h, h->devs[s]);
+    if (d->boot_media)
+        emergency_wipe("usb: the boot stick was removed");
+    pr_info("usb: device on port %d removed\n", d->port);
+    command(h, 0, (10U << 10) | ((uint32_t)d->slot << 24), NULL);    // disable slot
+    h->devs[d->slot] = NULL;
+    if (h->dcbaa[d->slot])
+        pmm_free(h->dcbaa[d->slot]);
+    h->dcbaa[d->slot] = 0;
+    for (int i = 0; i < d->nhid; i++) {
+        struct hid *x = d->hid[i];
+        if (x->in.trbs)
+            pmm_free(x->in.phys);
+        if (x->buf)
+            pmm_free(x->buf_phys);
+        kfree(x);
+    }
+    if (d->ep0.trbs)
+        pmm_free(d->ep0.phys);
+    if (d->buf)
+        pmm_free(d->buf_phys);
+    kfree(d);
+}
+
+static struct dev *dev_at(struct hc *h, struct dev *parent, int port)
+{
+    for (int s = 1; s <= h->slots; s++) {
+        struct dev *d = h->devs[s];
+        if (d && d->parent == parent && (parent ? d->hub_port : d->port) == port)
+            return d;
+    }
+    return NULL;
+}
+
 static bool attach(struct hc *h, int port, int speed, struct dev *parent, int hub_port);
 
 // hub port requests
@@ -506,6 +580,11 @@ static void scan_hub(struct dev *hub)
         bool on = status & 1;
         uint32_t bit = 1U << p;
         if (!on) {
+            if (hub->hub_attached & bit) {
+                struct dev *gone = dev_at(h, hub, p);
+                if (gone)
+                    detach(h, gone);
+            }
             hub->hub_attached &= ~bit;
             hub->hub_tries[p] = 0;
             continue;
@@ -555,6 +634,8 @@ static bool attach(struct hc *h, int port, int speed, struct dev *parent, int hu
     d->slot = (int)slot;
     d->port = port;
     d->speed = speed;
+    d->parent = parent;
+    d->hub_port = hub_port;
     if (parent) {
         d->depth = parent->depth + 1;
         d->route = parent->route | (uint32_t)(hub_port > 15 ? 15 : hub_port) << (4 * parent->depth);
@@ -614,10 +695,20 @@ static bool attach(struct hc *h, int port, int speed, struct dev *parent, int hu
     if (!cfg)
         return true;
     memcpy(cfg, buf, total);
-    if (dev_class == 9)
+    if (dev_class == 9) {
         setup_hub(d, cfg);
-    else if (!setup_hid(d, cfg, total))
-        pr_info("usb: port %d: device class %02x, not a keyboard or mouse\n", port, cfg[14]);
+    } else if (!setup_hid(d, cfg, total)) {
+        bool storage = false;
+        for (size_t off = 0; off + 9 <= total && cfg[off] >= 2; off += cfg[off])
+            if (cfg[off + 1] == 4 && cfg[off + 5] == 8)
+                storage = true;
+        if (storage && wipe_armed() && timer_uptime_ms() < boot_window) {
+            d->boot_media = true;
+            pr_ok("usb: boot stick on port %d, unplugging it wipes ram and powers off\n", port);
+        } else {
+            pr_info("usb: port %d: %s, not used\n", port, storage ? "storage" : "not a keyboard or mouse");
+        }
+    }
     kfree(cfg);
     return true;
 
@@ -660,6 +751,11 @@ static void scan_ports(struct hc *h)
             port_write(h, p, v & PORT_CHANGES);    // acknowledge
         bool on = v & PORT_CCS;
         if (!on) {
+            if (h->attached[p]) {
+                struct dev *gone = dev_at(h, NULL, p);
+                if (gone)
+                    detach(h, gone);
+            }
             h->attached[p] = false;
             h->tries[p] = 0;
             continue;
@@ -693,6 +789,25 @@ static void scan_ports(struct hc *h)
             scan_hub(h->devs[s]);
 }
 
+static struct waitq usb_wait = WAITQ_INIT;
+static bool usb_sleeping;
+
+// timer irq: input waiting on an event ring gets the usb thread run right away
+void xhci_tick(void)
+{
+    if (!usb_sleeping)
+        return;
+    for (int i = 0; i < nhc; i++) {
+        struct hc *h = hcs[i];
+        if ((h->ev[h->ev_idx].control & 1) == h->ev_cycle) {
+            usb_sleeping = false;
+            waitq_wake_all(&usb_wait);
+            sched_resched();
+            return;
+        }
+    }
+}
+
 static void usb_thread(void *arg)
 {
     (void)arg;
@@ -704,15 +819,20 @@ static void usb_thread(void *arg)
             struct hc *h = hcs[i];
             poll_events(h);
             for (int s = 1; s <= h->slots; s++)
-                if (h->devs[s] && h->devs[s]->kind == 1)
-                    keyboard_repeat(h->devs[s]);
+                for (int k = 0; h->devs[s] && k < h->devs[s]->nhid; k++)
+                    if (h->devs[s]->hid[k]->kind == 1)
+                        keyboard_repeat(h->devs[s]->hid[k]);
         }
         if (timer_uptime_ms() >= next_scan) {
             for (int i = 0; i < nhc; i++)
                 scan_ports(hcs[i]);
             next_scan = timer_uptime_ms() + 500;
         }
-        thread_sleep_ms(1);
+        uint64_t f = irq_save();
+        usb_sleeping = true;
+        waitq_sleep_timeout(&usb_wait, 1);
+        usb_sleeping = false;
+        irq_restore(f);
     }
 }
 
@@ -851,6 +971,7 @@ bool xhci_init(void)
     }
     if (!nhc)
         return false;
+    boot_window = timer_uptime_ms() + 15000;
     thread_create("usb", usb_thread, NULL, false);
     return true;
 }

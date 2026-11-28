@@ -16,7 +16,11 @@ while [ $i -lt 40 ] && ! xsetroot -solid steelblue 2>/dev/null; do
     sleep 0.5
     i=$((i + 1))
 done
-if [ -f "$HOME/.xinitrc" ]; then
+if [ -n "$ZOS_XAPP" ]; then
+    # one program from xrun, the session ends with it
+    twm &
+    $ZOS_XAPP
+elif [ -f "$HOME/.xinitrc" ]; then
     sh "$HOME/.xinitrc"
 else
     xterm -geometry 80x24+40+40 &

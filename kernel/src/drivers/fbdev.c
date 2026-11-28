@@ -77,7 +77,7 @@ static int fb_ioctl(struct vnode *v, struct file *f, unsigned long req, uint64_t
         uint64_t phys = (uint64_t)fb.addr - hhdm_offset;
         for (uint64_t off = 0; off < fb_bytes(); off += PAGE_SIZE)
             if (!vmm_map_user(as, FB_USER_BASE + off, phys + off,
-                              PTE_WRITE | PTE_NX | PTE_NOFREE))
+                              PTE_WRITE | PTE_NX | PTE_NOFREE | PTE_WC))
                 return ZK_ENOMEM;
         mapped_as = as;
         uint64_t addr = FB_USER_BASE;
@@ -169,7 +169,7 @@ static int fb_mmap(struct vnode *v, struct file *f, uint64_t va, uint64_t len,
         return ZK_EINVAL;
     uint64_t phys = (uint64_t)fb.addr - hhdm_offset + off;
     for (uint64_t o = 0; o < len; o += PAGE_SIZE)
-        if (!vmm_map_user(as, va + o, phys + o, pte_flags | PTE_NOFREE))
+        if (!vmm_map_user(as, va + o, phys + o, pte_flags | PTE_NOFREE | PTE_WC))
             return ZK_ENOMEM;
     return 0;
 }

@@ -23,3 +23,6 @@ void pmm_free_pages(uint64_t phys, size_t count);
 
 size_t pmm_total_pages(void);
 size_t pmm_free_count(void);
+// zeroes every page of ram except the ones in skip (sorted), allocations
+// included. the allocator is gone afterwards, it's for the last moments
+void pmm_wipe(const uint64_t *skip, size_t nskip);

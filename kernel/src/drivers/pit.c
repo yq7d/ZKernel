@@ -1,5 +1,6 @@
 // 8253/8254 pit, channel 0 on irq 0
 #include "net/net.h"
+#include "drivers/xhci.h"
 #include "drivers/pit.h"
 #include "arch/x86_64/interrupts.h"
 #include "arch/x86_64/io.h"
@@ -19,6 +20,7 @@ static void timer_irq(struct interrupt_frame *frame)
     ticks++;
     sched_tick();
     net_tick();
+    xhci_tick();
 }
 
 void timer_init(uint32_t hz)

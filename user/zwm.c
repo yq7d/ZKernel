@@ -1399,6 +1399,12 @@ static void reap(void)
 
 int main(void)
 {
+    // xrun finds us here when it wants the screen for x
+    int pfd = open("/tmp/.zwm.pid", O_WRONLY | O_CREAT | O_TRUNC);
+    if (pfd >= 0) {
+        dprintf(pfd, "%ld\n", getpid());
+        close(pfd);
+    }
     int fbfd = open("/dev/fb0", O_RDWR);
     if (fbfd < 0) {
         dprintf(2, "zwm: /dev/fb0: %s\n", strerror(fbfd));
