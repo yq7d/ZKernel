@@ -880,6 +880,44 @@ static void drop_link(struct enode *n)
     write_inode(n);
 }
 
+static const struct vnode_ops ops;
+
+// a hard link to a file on the same filesystem
+static int e_link(struct vnode *dv, const char *name, struct vnode *v)
+{
+    struct enode *dir = EN(dv);
+    struct sb *s = dir->sb;
+    if (v->ops != &ops)
+        return ZK_EPERM;    // devices and the like can't live on disk
+    struct enode *n = EN(v);
+    if (n->sb != s)
+        return ZK_EXDEV;
+    if (s->readonly)
+        return ZK_EROFS;
+    if ((n->in.mode & S_IFMT) == S_IFDIR)
+        return ZK_EPERM;
+    if (strlen(name) > 255)
+        return ZK_ENAMETOOLONG;
+    mutex_lock(&s->lock);
+    struct name_q q = { name, 0, 0 };
+    int err = 0;
+    if (dir->unlinked || n->unlinked)
+        err = ZK_ENOENT;
+    else if (each_entry(dir, by_name, &q, NULL, NULL) == 1)
+        err = ZK_EEXIST;
+    else if (n->in.links >= 65000)
+        err = ZK_EMFILE;
+    if (!err)
+        err = add_entry(dir, name, n->ino, ftype(n->in.mode));
+    if (!err) {
+        n->in.links++;
+        n->in.ctime = (uint32_t)rtc_now();
+        write_inode(n);
+    }
+    mutex_unlock(&s->lock);
+    return err;
+}
+
 static int e_unlink(struct vnode *dv, const char *name)
 {
     struct enode *dir = EN(dv);
@@ -1024,6 +1062,7 @@ static const struct vnode_ops ops = {
     .truncate = e_truncate,
     .lookup = e_lookup,
     .create = e_create,
+    .link = e_link,
     .unlink = e_unlink,
     .readdir = e_readdir,
     .rename = e_rename,

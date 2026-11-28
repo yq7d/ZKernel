@@ -430,9 +430,41 @@ struct apk {
     uint8_t *tar;        // all members decompressed back to back
     size_t len;
     char sum[64];        // Q1 + base64 sha1 of the control member
-    char *post_install, *pre_install;
-    size_t post_len, pre_len;
+    char *post_install, *pre_install, *trigger, *pkginfo;
+    size_t post_len, pre_len, trigger_len, pkginfo_len;
 };
+
+// apk triggers: a package's .trigger script runs once per transaction with
+// the dirs, matching its globs, that packages put files in
+#define TRIGGERS DB_DIR "/triggers"
+#define MAX_TOUCHED 512
+static char *touched[MAX_TOUCHED];
+static int ntouched;
+
+static void touch_dir(const char *dir)
+{
+    for (int i = 0; i < ntouched; i++)
+        if (strcmp(touched[i], dir) == 0)
+            return;
+    if (ntouched < MAX_TOUCHED)
+        touched[ntouched++] = strdup(dir);
+}
+
+// '*' doesn't cross a '/'
+static bool glob_match(const char *g, const char *s)
+{
+    if (*g == '\0')
+        return *s == '\0';
+    if (*g == '*') {
+        for (const char *p = s;; p++) {
+            if (glob_match(g + 1, p))
+                return true;
+            if (*p == '\0' || *p == '/')
+                return false;
+        }
+    }
+    return *g == *s && glob_match(g + 1, s + 1);
+}
 
 static int open_apk(const uint8_t *raw, size_t rawlen, struct apk *a)
 {
@@ -478,6 +510,12 @@ static void extract_one(struct tarent *e, void *ctx)
         if (strcmp(name, ".post-install") == 0) {
             x->apk->post_install = (char *)e->data;
             x->apk->post_len = e->size;
+        } else if (strcmp(name, ".trigger") == 0) {
+            x->apk->trigger = (char *)e->data;
+            x->apk->trigger_len = e->size;
+        } else if (strcmp(name, ".PKGINFO") == 0) {
+            x->apk->pkginfo = (char *)e->data;
+            x->apk->pkginfo_len = e->size;
         } else if (strcmp(name, ".pre-install") == 0) {
             x->apk->pre_install = (char *)e->data;
             x->apk->pre_len = e->size;
@@ -495,6 +533,8 @@ static void extract_one(struct tarent *e, void *ctx)
     if (slash) {
         *slash = '\0';
         mkdirs(path);
+        if (e->type != '5')
+            touch_dir(path + strlen(ROOT));
         *slash = '/';
     }
     if (e->type == '5') {
@@ -529,7 +569,16 @@ static void extract_one(struct tarent *e, void *ctx)
 }
 
 // runs with the interpreter from its #! line, inside the linux tree
+static int run_script_args(const char *script, size_t len, const char *what,
+                           const char *pkgname, char **args, int nargs);
+
 static int run_script(const char *script, size_t len, const char *what, const char *pkgname)
+{
+    return run_script_args(script, len, what, pkgname, NULL, 0);
+}
+
+static int run_script_args(const char *script, size_t len, const char *what,
+                           const char *pkgname, char **args, int nargs)
 {
     if (!script)
         return 0;
@@ -560,8 +609,19 @@ static int run_script(const char *script, size_t len, const char *what, const ch
     char path[] = "/tmp/pkg-script";
     if (write_file(path, script, len, 0755) != 0)
         return -1;
-    char *argv[] = { interp, arg[0] ? arg : path, arg[0] ? path : NULL, NULL };
+    char **argv = malloc((size_t)(nargs + 4) * sizeof *argv);
+    if (!argv)
+        return -1;
+    int n = 0;
+    argv[n++] = interp;
+    if (arg[0])
+        argv[n++] = arg;
+    argv[n++] = path;
+    for (int i = 0; i < nargs; i++)
+        argv[n++] = args[i];
+    argv[n] = NULL;
     long pid = spawn(real, argv, NULL);
+    free(argv);
     int status = -1;
     if (pid > 0)
         wait(pid, &status, 0);
@@ -634,6 +694,67 @@ static int download(const char *url, const char *dest, const char *label, uint64
     return err;
 }
 
+// keeps a package's trigger script and globs for later transactions
+static void save_trigger(const char *name, struct apk *a)
+{
+    char path[ZK_PATH_MAX];
+    snprintf(path, sizeof path, TRIGGERS "/%s.trigger", name);
+    char globs[1024] = "";
+    for (const char *l = a->pkginfo; a->trigger && l && l < a->pkginfo + a->pkginfo_len;) {
+        const char *end = l;
+        while (end < a->pkginfo + a->pkginfo_len && *end != '\n')
+            end++;
+        if ((size_t)(end - l) > 11 && strncmp(l, "triggers = ", 11) == 0) {
+            size_t n = (size_t)(end - l) - 11;
+            if (n >= sizeof globs)
+                n = sizeof globs - 1;
+            memcpy(globs, l + 11, n);
+            globs[n] = '\0';
+        }
+        l = end + 1;
+    }
+    if (!a->trigger || !globs[0]) {
+        unlink(path);
+        return;
+    }
+    mkdirs(TRIGGERS);
+    write_file(path, a->trigger, a->trigger_len, 0755);
+    snprintf(path, sizeof path, TRIGGERS "/%s.globs", name);
+    write_file(path, globs, strlen(globs), 0644);
+}
+
+static void run_triggers(void)
+{
+    for (size_t i = 0; i < ndb && ntouched; i++) {
+        if (!db[i].name[0])
+            continue;
+        char path[ZK_PATH_MAX];
+        size_t glen, slen;
+        snprintf(path, sizeof path, TRIGGERS "/%s.globs", db[i].name);
+        char *globs = (char *)read_file(path, &glen);
+        if (!globs)
+            continue;
+        snprintf(path, sizeof path, TRIGGERS "/%s.trigger", db[i].name);
+        char *script = (char *)read_file(path, &slen);
+        char *args[MAX_TOUCHED];
+        int nargs = 0;
+        for (int t = 0; t < ntouched; t++) {
+            char *g = strdup(globs), *save;
+            bool hit = false;
+            for (char *w = g ? strtok_r(g, " \t\n", &save) : NULL; w && !hit;
+                 w = strtok_r(NULL, " \t\n", &save))
+                hit = glob_match(w, touched[t]);
+            free(g);
+            if (hit)
+                args[nargs++] = touched[t];
+        }
+        if (nargs && script)
+            run_script_args(script, slen, "trigger", db[i].name, args, nargs);
+        free(globs);
+        free(script);
+    }
+}
+
 static void install_one(struct pkgent *p)
 {
     char url[1024], file[ZK_PATH_MAX], label[96];
@@ -643,6 +764,11 @@ static void install_one(struct pkgent *p)
     struct zk_stat st;
     if (stat(file, &st) != 0 || st.size != p->size) {
         int err = download(url, file, label, p->size);
+        // mirrors hiccup now and then, a 404 included
+        for (int tries = 1; err && tries < 3; tries++) {
+            sleep_ms(1000);
+            err = download(url, file, label, p->size);
+        }
         if (err)
             die("can't download %s: %s", p->name, strerror(err));
     }
@@ -683,6 +809,7 @@ static void install_one(struct pkgent *p)
         db[ndb++] = fresh;
     }
     save_db();
+    save_trigger(p->name, &a);
     if (a.post_install)
         run_script(a.post_install, a.post_len, "post-install", p->name);
     free(a.tar);
@@ -850,6 +977,7 @@ static int cmd_install(int argc, char **argv, bool reinstall)
     mkdirs(CACHE);
     for (size_t i = 0; i < nplan; i++)
         install_one(plan[i]);
+    run_triggers();
     printf("done\n");
     return 0;
 }
@@ -894,6 +1022,7 @@ static int cmd_upgrade(void)
     printf("\n");
     for (size_t i = 0; i < nplan; i++)
         install_one(plan[i]);
+    run_triggers();
     printf("done\n");
     return 0;
 }
