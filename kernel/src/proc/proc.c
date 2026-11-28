@@ -307,6 +307,81 @@ static int read_exec(const char *path, struct zk_stat *st, void **data, size_t *
     return vfs_read_all(path, data, size, PROC_MAX_EXEC);
 }
 
+static int build_image(const char *path, char **argv, char **envp,
+                       const struct zk_cred *cred, struct address_space **as_out,
+                       struct user_start *s, struct zk_stat *st, int *abi);
+
+// "#!interp [arg]" scripts run as interp [arg] script args...
+static int run_script(const char *path, const char *text, size_t size, char **argv,
+                      char **envp, const struct zk_cred *cred,
+                      struct address_space **as_out, struct user_start *s,
+                      struct zk_stat *st, int *abi, int depth)
+{
+    if (depth > 4)
+        return ZK_ELOOP;
+    char line[ZK_PATH_MAX];
+    size_t n = 0;
+    for (size_t i = 2; i < size && text[i] != '\n' && n + 1 < sizeof line; i++)
+        line[n++] = text[i];
+    line[n] = '\0';
+    char *p = line;
+    while (*p == ' ' || *p == '\t')
+        p++;
+    char *interp = p;
+    while (*p && *p != ' ' && *p != '\t')
+        p++;
+    char *arg = NULL;
+    if (*p) {
+        *p++ = '\0';
+        while (*p == ' ' || *p == '\t')
+            p++;
+        // linux passes the rest as one argument, trailing blanks dropped
+        size_t len = strlen(p);
+        while (len && (p[len - 1] == ' ' || p[len - 1] == '\t' || p[len - 1] == '\r'))
+            p[--len] = '\0';
+        if (len)
+            arg = p;
+    }
+    if (!interp[0])
+        return ZK_ENOEXEC;
+
+    // scripts from linux packages mean the linux tree's interpreter
+    char ipath[ZK_PATH_MAX];
+    size_t rl = strlen(LINUX_ROOT);
+    if (strncmp(path, LINUX_ROOT, rl) == 0 && path[rl] == '/')
+        linux_resolve(interp, ipath, false);
+    else
+        strlcpy(ipath, interp, sizeof ipath);
+
+    int argc = 0;
+    while (argv && argv[argc])
+        argc++;
+    char **nargv = kmalloc(sizeof(char *) * (size_t)(argc + 4));
+    if (!nargv)
+        return ZK_ENOMEM;
+    int k = 0;
+    nargv[k++] = interp;
+    if (arg)
+        nargv[k++] = arg;
+    nargv[k++] = (char *)path;
+    for (int i = 1; i < argc; i++)
+        nargv[k++] = argv[i];
+    nargv[k] = NULL;
+
+    void *data;
+    size_t dsize;
+    int err = read_exec(ipath, st, &data, &dsize);
+    if (!err && dsize > 2 && ((char *)data)[0] == '#' && ((char *)data)[1] == '!') {
+        err = run_script(ipath, data, dsize, nargv, envp, cred, as_out, s, st, abi, depth + 1);
+        kfree(data);
+    } else if (!err) {
+        kfree(data);
+        err = build_image(ipath, nargv, envp, cred, as_out, s, st, abi);
+    }
+    kfree(nargv);
+    return err;
+}
+
 // new address space with the program (and its interpreter) loaded and the
 // stack set up. *abi says what kind of program it is
 static int build_image(const char *path, char **argv, char **envp,
@@ -318,6 +393,12 @@ static int build_image(const char *path, char **argv, char **envp,
     int err = read_exec(path, st, &data, &size);
     if (err)
         return err;
+    if (size > 2 && ((char *)data)[0] == '#' && ((char *)data)[1] == '!') {
+        // scripts never run set-id, the interpreter's own bits apply
+        err = run_script(path, data, size, argv, envp, cred, as_out, s, st, abi, 0);
+        kfree(data);
+        return err;
+    }
 
     struct address_space *as = vmm_create_space();
     if (!as) {
