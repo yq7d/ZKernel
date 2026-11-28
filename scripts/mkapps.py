@@ -151,6 +151,16 @@ def main():
         subprocess.run(["glib-compile-schemas", schemas], check=False)
     for d in ("tmp", "var/tmp", "var/cache/fontconfig", "var/lib/xkb"):
         os.makedirs(os.path.join(root, d), exist_ok=True)
+    # there's no font cache (it would take running alpine's fc-cache), so
+    # fontconfig opens every font on each start. keep it off the hundreds of
+    # bitmap fonts only the x server uses, leaving it the few ttf ones
+    if os.path.isdir(os.path.join(root, "etc/fonts/conf.d")):
+        with open(os.path.join(root, "etc/fonts/conf.d/05-zos-bitmaps.conf"), "w") as f:
+            f.write('<?xml version="1.0"?>\n<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">\n'
+                    "<fontconfig>\n  <selectfont>\n    <rejectfont>\n"
+                    + "".join(f"      <glob>/usr/share/fonts/{d}/*</glob>\n"
+                              for d in ("misc", "75dpi", "100dpi", "cyrillic", "encodings"))
+                    + "    </rejectfont>\n  </selectfont>\n</fontconfig>\n")
 
     used = int(subprocess.check_output(["du", "-sk", root]).split()[0])
     files = sum(len(f) + len(d) for _, d, f in os.walk(root))

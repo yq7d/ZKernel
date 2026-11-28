@@ -88,10 +88,14 @@ void linux_resolve(const char *path, char *out, bool creating)
         strlcpy(out, alt, ZK_PATH_MAX);
         return;
     }
+    // the bundled apps are read only: what gets written goes to the linux
+    // tree when it can, and shadows the bundled copy from then on
     char apps[ZK_PATH_MAX];
-    if (snprintf(apps, sizeof apps, APPS_ROOT "%s", path) < (int)sizeof apps &&
-        vfs_lookup_nofollow(apps, &v) == 0) {
+    bool in_apps = snprintf(apps, sizeof apps, APPS_ROOT "%s", path) < (int)sizeof apps &&
+                   vfs_lookup_nofollow(apps, &v) == 0;
+    if (in_apps)
         vnode_put(v);
+    if (in_apps && !creating) {
         strlcpy(out, apps, ZK_PATH_MAX);
         return;
     }
@@ -105,8 +109,11 @@ void linux_resolve(const char *path, char *out, bool creating)
             vnode_put(v);
             *slash = '/';
             strlcpy(out, alt, ZK_PATH_MAX);
+            return;
         }
     }
+    if (in_apps)
+        strlcpy(out, apps, ZK_PATH_MAX);
 }
 
 static struct proc *me(void)
@@ -232,6 +239,17 @@ static int alloc_fd_from(struct proc *p, int min, struct file *f)
     return proc_fd_alloc_from(p, f, min);
 }
 
+// the terminal /dev/tty means, and where sudo and friends prompt
+static void set_ctty(struct proc *p, struct vnode *v)
+{
+    if (v)
+        vnode_get(v);
+    struct vnode *old = p->ctty;
+    p->ctty = v;
+    if (old)
+        vnode_put(old);
+}
+
 static int64_t l_openat(int dirfd, uint64_t upath, int flags, uint32_t mode)
 {
     char path[ZK_PATH_MAX];
@@ -255,6 +273,9 @@ static int64_t l_openat(int dirfd, uint64_t upath, int flags, uint32_t mode)
         proc_set_cloexec(me(), fd, true);
     if (flags & O_NONBLOCK)
         f->flags |= O_NONBLOCK;
+    // a session without a terminal takes the first one it opens
+    if (!me()->ctty && !(flags & 0400) && tty_of(f->v))    // O_NOCTTY
+        set_ctty(me(), f->v);
     return fd;
 }
 
@@ -575,8 +596,12 @@ static int64_t l_ioctl(int fd, unsigned long req, uint64_t arg)
         f->flags = on ? f->flags | O_NONBLOCK : f->flags & ~O_NONBLOCK;
         return 0;
     }
-    case 0x5422:    // TIOCNOTTY
     case 0x540E:    // TIOCSCTTY
+        if (!t)
+            return ZK_ENOTTY;
+        set_ctty(me(), f->v);
+        return 0;
+    case 0x5422:    // TIOCNOTTY
     case 0x5451:    // FIOCLEX
         return t ? 0 : ZK_ENOTTY;
     case 0x541B: {  // FIONREAD
@@ -1522,7 +1547,14 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 21:  return l_access(AT_FDCWD, A1, (int)A2);
     case 22:  return sys_pipe(A1);
     case 24:  thread_yield(); return 0;
-    case 25:  return ZK_ENOMEM;    // mremap, callers fall back to copying
+    case 25: {    // mremap: never moves or grows, callers fall back to copying.
+        // an unmapped address says EFAULT, musl finds the stack's end that way
+        struct address_space *as = thread_current()->as;
+        if ((A1 & (PAGE_SIZE - 1)) || (!vmm_translate_user(as, A1, NULL) &&
+                                        !filemap_covers(as, A1)))
+            return ZK_EFAULT;
+        return ZK_ENOMEM;
+    }
     case 26:  return 0;            // msync
     case 28:  return 0;            // madvise
     case 32: {
@@ -1614,7 +1646,10 @@ static int64_t dispatch(struct interrupt_frame *f)
         return 0;
     case 110: return p->parent ? (int64_t)p->parent->pid : 1;
     case 111: return (int64_t)p->pgid;
-    case 112: p->pgid = p->pid; return (int64_t)p->pid;    // setsid
+    case 112:    // setsid: a new session has no controlling terminal yet
+        p->pgid = p->pid;
+        set_ctty(p, NULL);
+        return (int64_t)p->pid;
     case 115: return l_getgroups((int)A1, A2);
     case 116: return sys_setgroups(A1, A2);
     case 117: return sys_setuid((uint32_t)A2);    // setresuid, close enough

@@ -26,6 +26,16 @@ void vnode_get(struct vnode *v)
     __atomic_fetch_add(&v->refs, 1, __ATOMIC_RELAXED);
 }
 
+bool vnode_get_unless_zero(struct vnode *v)
+{
+    int n = __atomic_load_n(&v->refs, __ATOMIC_RELAXED);
+    while (n > 0)
+        if (__atomic_compare_exchange_n(&v->refs, &n, n + 1, false, __ATOMIC_ACQ_REL,
+                                        __ATOMIC_RELAXED))
+            return true;
+    return false;
+}
+
 void vnode_put(struct vnode *v)
 {
     if (__atomic_sub_fetch(&v->refs, 1, __ATOMIC_ACQ_REL) == 0 && v->ops->release)

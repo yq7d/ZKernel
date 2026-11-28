@@ -50,7 +50,7 @@ struct fat_node {
     bool unlinked;        // clusters get freed when the last reference goes
     uint32_t cur_idx, cur_clus;    // last cluster walked to, for sequential io
     struct fat_node *next;
-    int releasing;    // release calls waiting for the lock
+    bool detached;        // dropped from the cache while its release was pending
 };
 
 // one directory entry as found by a scan
@@ -425,11 +425,16 @@ static uint32_t dotdot_cluster(struct fat_node *n)
 static struct fat_node *get_node(struct fat_sb *sb, const struct dent *d)
 {
     uint64_t off = d->offs[d->nslots - 1];
-    for (struct fat_node *n = sb->nodes; n; n = n->next) {
-        if (n->ent_off == off) {
-            vnode_get(&n->v);
+    for (struct fat_node **pp = &sb->nodes; *pp; pp = &(*pp)->next) {
+        struct fat_node *n = *pp;
+        if (n->ent_off != off)
+            continue;
+        if (vnode_get_unless_zero(&n->v))
             return n;
-        }
+        // its release is coming and frees it, a fresh node takes its place
+        *pp = n->next;
+        n->detached = true;
+        break;
     }
     struct fat_node *n = kzalloc(sizeof(*n));
     if (!n)
@@ -1102,15 +1107,8 @@ static void release(struct vnode *v)
 {
     struct fat_node *n = NODE(v);
     struct fat_sb *sb = n->sb;
-    // the node can be found and handed out again while we wait, see ext2
-    __atomic_add_fetch(&n->releasing, 1, __ATOMIC_ACQ_REL);
     mutex_lock(&sb->lock);
-    if (__atomic_sub_fetch(&n->releasing, 1, __ATOMIC_ACQ_REL) > 0 ||
-        __atomic_load_n(&n->v.refs, __ATOMIC_ACQUIRE) > 0) {
-        unlock(sb);
-        return;
-    }
-    for (struct fat_node **p = &sb->nodes; *p; p = &(*p)->next) {
+    for (struct fat_node **p = &sb->nodes; *p && !n->detached; p = &(*p)->next) {
         if (*p == n) {
             *p = n->next;
             break;

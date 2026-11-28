@@ -97,6 +97,8 @@ uint64_t vfs_next_ino(void);
 
 void vnode_get(struct vnode *v);
 void vnode_put(struct vnode *v);
+// a reference unless the count already hit zero (the vnode is on its way out)
+bool vnode_get_unless_zero(struct vnode *v);
 
 // joins path onto cwd and resolves . and .. into out (ZK_PATH_MAX bytes)
 int vfs_normalize(const char *cwd, const char *path, char *out);
