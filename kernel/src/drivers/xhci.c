@@ -73,6 +73,7 @@ struct dev {
     int hub_ports;          // nonzero for hubs
     bool hub_ss;            // a usb 3 hub
     uint32_t hub_attached;  // bit per hub port with a device on it
+    uint8_t hub_tries[16];
     struct ring ep0;
     struct ring in;         // the hid interrupt endpoint
     int in_dci;
@@ -97,6 +98,7 @@ struct hc {
     uint32_t ev_idx, ev_cycle;
     struct dev *devs[256];   // by slot
     bool attached[256];      // by port
+    uint8_t tries[256];      // failed attaches by port, given up at 3
     // the last command and control transfer completions, for the waits
     bool cmd_done, xfer_done;
     uint32_t cmd_code, cmd_slot, xfer_code;
@@ -366,7 +368,7 @@ static int interval(int speed, uint8_t b)
     return n;
 }
 
-static void setup_hid(struct dev *d, const uint8_t *cfg, size_t len)
+static bool setup_hid(struct dev *d, const uint8_t *cfg, size_t len)
 {
     struct hc *h = d->hc;
     int iface = -1, kind = 0, ep = 0;
@@ -391,16 +393,18 @@ static void setup_hid(struct dev *d, const uint8_t *cfg, size_t len)
         }
     }
     if (!kind || !ep)
-        return;
+        return false;
 
     uint8_t cfgval = cfg[5];
-    if (!control(d, 0x00, 9, cfgval, 0, 0, 0))    // set configuration
-        return;
+    if (!control(d, 0x00, 9, cfgval, 0, 0, 0)) {    // set configuration
+        pr_warn("usb: port %d: set configuration failed\n", d->port);
+        return true;
+    }
     control(d, 0x21, 0x0B, 0, (uint16_t)iface, 0, 0);    // set protocol: boot
     control(d, 0x21, 0x0A, 0, (uint16_t)iface, 0, 0);    // set idle
 
     if (!ring_init(&d->in))
-        return;
+        return true;
     d->in_dci = ep * 2 + 1;
     d->in_mps = mps < 8 ? 8 : mps;
     d->kind = kind;
@@ -408,7 +412,7 @@ static void setup_hid(struct dev *d, const uint8_t *cfg, size_t len)
     uint64_t inphys;
     void *input = dma_page(&inphys);
     if (!input)
-        return;
+        return true;
     uint32_t *icc = ctx(h, input, 0);
     icc[1] = 1U | (1U << d->in_dci);    // add slot and the endpoint
     uint32_t *slot = ctx(h, input, 1);
@@ -423,14 +427,17 @@ static void setup_hid(struct dev *d, const uint8_t *cfg, size_t len)
     e[4] = mps | ((uint32_t)mps << 16);
     bool ok = command(h, inphys, (TRB_CONFIGURE << 10) | ((uint32_t)d->slot << 24), NULL);
     pmm_free(inphys);
-    if (!ok)
-        return;
+    if (!ok) {
+        pr_warn("usb: port %d: configure endpoint failed\n", d->port);
+        return true;
+    }
     pr_ok("usb: %s on port %d\n", kind == 1 ? "keyboard" : "mouse", d->port);
     queue_in(d);
+    return true;
 }
 
 static void scan_hub(struct dev *hub);
-static void attach(struct hc *h, int port, int speed, struct dev *parent, int hub_port);
+static bool attach(struct hc *h, int port, int speed, struct dev *parent, int hub_port);
 
 // hub port requests
 #define HUB_SET 0x23
@@ -500,6 +507,7 @@ static void scan_hub(struct dev *hub)
         uint32_t bit = 1U << p;
         if (!on) {
             hub->hub_attached &= ~bit;
+            hub->hub_tries[p] = 0;
             continue;
         }
         if (hub->hub_attached & bit)
@@ -521,21 +529,27 @@ static void scan_hub(struct dev *hub)
         if (!(status & 2))
             continue;    // didn't enable
         int speed = hub->hub_ss ? 4 : (status & (1 << 9)) ? 2 : (status & (1 << 10)) ? 3 : 1;
-        attach(h, hub->port, speed, hub, p);
+        if (!attach(h, hub->port, speed, hub, p) && ++hub->hub_tries[p] < 3)
+            hub->hub_attached &= ~bit;    // again on the next scan
     }
 }
 
-static void attach(struct hc *h, int port, int speed, struct dev *parent, int hub_port)
+// a new device: address it, read its descriptors and set it up if it's a hub,
+// keyboard or mouse. false when it couldn't be talked to, so it gets retried
+static bool attach(struct hc *h, int port, int speed, struct dev *parent, int hub_port)
 {
+    const char *step = "enable slot";
     uint32_t slot;
-    if (!command(h, 0, TRB_ENABLE << 10, &slot) || !slot || slot > (uint32_t)h->slots)
-        return;
+    if (!command(h, 0, TRB_ENABLE << 10, &slot) || !slot || slot > (uint32_t)h->slots) {
+        pr_warn("usb: port %d: no slot for the device\n", port);
+        return false;
+    }
     struct dev *d = kzalloc(sizeof *d);
-    uint64_t outphys, inphys;
+    uint64_t outphys = 0, inphys = 0;
     void *out = dma_page(&outphys), *input = dma_page(&inphys);
     if (!d || !out || !input || !ring_init(&d->ep0) || !(d->buf = dma_page(&d->buf_phys))) {
-        kfree(d);
-        return;
+        step = "memory";
+        goto fail;
     }
     d->hc = h;
     d->slot = (int)slot;
@@ -568,17 +582,16 @@ static void attach(struct hc *h, int port, int speed, struct dev *parent, int hu
     e0[3] = (uint32_t)(d->ep0.phys >> 32);
     e0[4] = 8;
     h->devs[slot] = d;
-    if (!command(h, inphys, (TRB_ADDRESS << 10) | (slot << 24), NULL)) {
-        pmm_free(inphys);
-        return;
-    }
+    step = "address device";
+    if (!command(h, inphys, (TRB_ADDRESS << 10) | (slot << 24), NULL))
+        goto fail;
+    thread_sleep_ms(10);
 
     // device descriptor, first 8 bytes for the real endpoint 0 size
     uint8_t *buf = d->buf;
-    if (!control(d, 0x80, 6, 0x100, 0, 8, d->buf_phys)) {
-        pmm_free(inphys);
-        return;
-    }
+    step = "device descriptor";
+    if (!control(d, 0x80, 6, 0x100, 0, 8, d->buf_phys))
+        goto fail;
     uint8_t dev_class = buf[4];
     if (speed == 1 && buf[7] && buf[7] != 8) {
         icc[1] = 2;
@@ -586,24 +599,45 @@ static void attach(struct hc *h, int port, int speed, struct dev *parent, int hu
         command(h, inphys, (TRB_EVALUATE << 10) | (slot << 24), NULL);
     }
     pmm_free(inphys);
+    inphys = 0;
 
     // configuration descriptor, all of it
+    step = "config descriptor";
     if (!control(d, 0x80, 6, 0x200, 0, 9, d->buf_phys))
-        return;
+        goto fail;
     uint16_t total = (uint16_t)(buf[2] | buf[3] << 8);
     if (total > PAGE_SIZE)
         total = PAGE_SIZE;
-    if (!control(d, 0x80, 6, 0x200, 0, total, d->buf_phys))
-        return;
+    if (total < 9 || !control(d, 0x80, 6, 0x200, 0, total, d->buf_phys))
+        goto fail;
     uint8_t *cfg = kmalloc(total);
     if (!cfg)
-        return;
+        return true;
     memcpy(cfg, buf, total);
     if (dev_class == 9)
         setup_hub(d, cfg);
-    else
-        setup_hid(d, cfg, total);
+    else if (!setup_hid(d, cfg, total))
+        pr_info("usb: port %d: device class %02x, not a keyboard or mouse\n", port, cfg[14]);
     kfree(cfg);
+    return true;
+
+fail:
+    pr_warn("usb: port %d (speed %d): %s failed, will retry\n", port, speed, step);
+    command(h, 0, (10U << 10) | (slot << 24), NULL);    // disable slot
+    h->devs[slot] = NULL;
+    h->dcbaa[slot] = 0;
+    if (inphys)
+        pmm_free(inphys);
+    if (outphys)
+        pmm_free(outphys);
+    if (d) {
+        if (d->ep0.trbs)
+            pmm_free(d->ep0.phys);
+        if (d->buf)
+            pmm_free(d->buf_phys);
+        kfree(d);
+    }
+    return false;
 }
 
 static volatile uint32_t *portsc(struct hc *h, int port)
@@ -627,11 +661,14 @@ static void scan_ports(struct hc *h)
         bool on = v & PORT_CCS;
         if (!on) {
             h->attached[p] = false;
+            h->tries[p] = 0;
             continue;
         }
         if (h->attached[p])
             continue;
         h->attached[p] = true;
+        thread_sleep_ms(50);    // let the plug settle
+        v = *portsc(h, p);
         if (!(v & PORT_PED)) {
             port_write(h, p, PORT_PR);
             uint64_t end = timer_uptime_ms() + 200;
@@ -640,10 +677,15 @@ static void scan_ports(struct hc *h)
             port_write(h, p, PORT_PRC);
             thread_sleep_ms(20);
             v = *portsc(h, p);
-            if (!(v & PORT_PED))
+            if (!(v & PORT_PED)) {
+                pr_warn("usb: port %d didn't enable after reset\n", p);
+                if (++h->tries[p] < 3)
+                    h->attached[p] = false;
                 continue;
+            }
         }
-        attach(h, p, (int)((v >> 10) & 15), NULL, 0);
+        if (!attach(h, p, (int)((v >> 10) & 15), NULL, 0) && ++h->tries[p] < 3)
+            h->attached[p] = false;    // again on the next scan
     }
     // hubs answer requests, they don't raise port events here
     for (int s = 1; s <= h->slots; s++)

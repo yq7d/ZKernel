@@ -248,7 +248,12 @@ static void kmain_late(void)
     virtio_blk_init();
     ahci_init();
     nvme_init();
-    xhci_init();
+    // "nousb" leaves usb to the firmware, its legacy emulation keeps working
+    char nousb[4];
+    if (cmdline_get("nousb", nousb, sizeof nousb))
+        pr_info("usb: left to the firmware (nousb)\n");
+    else
+        xhci_init();
     blk_start_flusher();
     mount_apps();
 

@@ -134,20 +134,20 @@ int main(void)
         cmdline[n > 0 ? n : 0] = '\0';
         close(cfd);
     }
-    bool gui = true, want_zwm = false;
+    bool gui = true, want_x = false;
     for (char *w = cmdline; *w; ) {
         while (isspace(*w))
             w++;
         size_t len = strcspn_ws(w);
         if (len == 4 && strncmp(w, "text", 4) == 0)
             gui = false;
-        if (len == 3 && strncmp(w, "zwm", 3) == 0)
-            want_zwm = true;
+        if (len == 3 && strncmp(w, "x11", 3) == 0)
+            want_x = true;
         w += len;
     }
-    // x with twm once xorg is installed, "zwm" on the command line keeps zwm
+    // zwm, or x with twm for "x11" on the command line when xorg is there
     struct zk_stat xst;
-    bool use_x = !want_zwm && (stat("/compat/linux/usr/bin/Xorg", &xst) == 0 ||
+    bool use_x = want_x && (stat("/compat/linux/usr/bin/Xorg", &xst) == 0 ||
                                stat("/compat/apps/usr/bin/Xorg", &xst) == 0);
     for (;;) {
         if (gui && use_x) {
