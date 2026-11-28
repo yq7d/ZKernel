@@ -1,3 +1,4 @@
+#include "drivers/xhci.h"
 #include "fs/sysfs.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -247,6 +248,7 @@ static void kmain_late(void)
     virtio_blk_init();
     ahci_init();
     nvme_init();
+    xhci_init();
     blk_start_flusher();
     mount_apps();
 

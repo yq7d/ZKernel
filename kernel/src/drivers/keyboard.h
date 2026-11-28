@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stdint.h>
 
 // keys without an ascii value
 enum {
@@ -17,6 +18,8 @@ enum {
 };
 
 bool keyboard_init(void);
+// a set 1 scancode from somewhere other than the ps/2 port (usb keyboards)
+void keyboard_scancode(uint8_t sc);
 
 // blocks until a key is pressed. returns ascii or a KEY_* code,
 // -1 if the calling process got killed

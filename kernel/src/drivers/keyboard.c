@@ -229,6 +229,13 @@ static void handle_scancode(uint8_t sc)
         keyboard_inject(key);
 }
 
+void keyboard_scancode(uint8_t sc)
+{
+    uint64_t f = irq_save();
+    handle_scancode(sc);
+    irq_restore(f);
+}
+
 static void keyboard_irq(struct interrupt_frame *frame)
 {
     (void)frame;

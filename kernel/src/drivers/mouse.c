@@ -71,6 +71,13 @@ static void mouse_irq(struct interrupt_frame *f)
     push(dx, -dy, packet[0] & 7);
 }
 
+void mouse_report(int dx, int dy, uint8_t buttons)
+{
+    uint64_t f = irq_save();
+    push(dx, dy, buttons);
+    irq_restore(f);
+}
+
 bool mouse_init(void)
 {
     if (!ps2_mouse_init())
