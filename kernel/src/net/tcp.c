@@ -410,6 +410,13 @@ void tcp_timer(void)
 
 struct tcb *tcp_open(uint32_t dst, uint16_t dport, uint16_t lport, int *err)
 {
+    // only the client side exists, so nothing here could ever answer. x
+    // clients try localhost:6000 before the server is up and would otherwise
+    // sit through every retransmit
+    if ((dst >> 24) == 127 || dst == netif.ip) {
+        *err = ZK_ECONNREFUSED;
+        return NULL;
+    }
     struct tcb *t = kzalloc(sizeof(*t));
     uint8_t *tx = kmalloc(BUF_SIZE), *rx = kmalloc(RX_SIZE);
     if (!t || !tx || !rx) {

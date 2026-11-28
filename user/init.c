@@ -123,7 +123,8 @@ int main(void)
     }
     setup_user();
 
-    char *desktop[] = { "/bin/zwm", NULL };
+    char *zwm[] = { "/bin/zwm", NULL };
+    char *x11[] = { "/bin/startx", NULL };
     char *shell[] = { "/bin/sh", NULL };
     // "text" on the kernel command line skips the desktop
     char cmdline[256] = "";
@@ -133,19 +134,32 @@ int main(void)
         cmdline[n > 0 ? n : 0] = '\0';
         close(cfd);
     }
-    bool gui = true;
+    bool gui = true, want_zwm = false;
     for (char *w = cmdline; *w; ) {
         while (isspace(*w))
             w++;
         size_t len = strcspn_ws(w);
         if (len == 4 && strncmp(w, "text", 4) == 0)
             gui = false;
+        if (len == 3 && strncmp(w, "zwm", 3) == 0)
+            want_zwm = true;
         w += len;
     }
+    // x with twm once xorg is installed, "zwm" on the command line keeps zwm
+    struct zk_stat xst;
+    bool use_x = !want_zwm && stat("/compat/linux/usr/bin/Xorg", &xst) == 0;
     for (;;) {
-        if (gui) {
+        if (gui && use_x) {
             uint64_t began = uptime_ms();
-            int status = run(desktop, true);
+            int status = run(x11, true);
+            if (status != 0 && uptime_ms() - began < 15000) {
+                printf("init: x didn't start (see /tmp/Xorg.0.log), using zwm\n");
+                use_x = false;
+            }
+        }
+        if (gui && !use_x) {
+            uint64_t began = uptime_ms();
+            int status = run(zwm, true);
             // it couldn't even start, no point trying again
             if (status != 0 && uptime_ms() - began < 3000) {
                 printf("init: the desktop failed to start, using the text console\n");

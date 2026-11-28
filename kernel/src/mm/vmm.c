@@ -1,3 +1,4 @@
+#include "mm/filemap.h"
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "mm/mm.h"
@@ -340,6 +341,7 @@ void vmm_destroy_space(struct address_space *as)
             free_table(phys_to_virt(e & PTE_ADDR_MASK), 3);
     }
     pmm_free(as->pml4_phys);
+    filemap_destroy(as);
     kfree(as);
 }
 
@@ -437,7 +439,7 @@ bool vmm_user_range_ok(struct address_space *as, uint64_t addr, size_t len, bool
         return false;
     for (uint64_t p = ALIGN_DOWN(addr, PAGE_SIZE); p < addr + len; p += PAGE_SIZE) {
         uint64_t e = walk(as->pml4, p, NULL);
-        if (!(e & PTE_PRESENT) && vmm_grow_stack(as, p))
+        if (!(e & PTE_PRESENT) && (filemap_fault(as, p, write) || vmm_grow_stack(as, p)))
             e = walk(as->pml4, p, NULL);
         if (!(e & PTE_USER))
             return false;
@@ -499,6 +501,10 @@ struct address_space *vmm_clone_space(struct address_space *src)
     as->mmap_next = src->mmap_next;
     as->stack_low = src->stack_low;
     as->stack_top = src->stack_top;
+    if (!filemap_clone(as, src)) {
+        vmm_destroy_space(as);
+        return NULL;
+    }
 
     uint64_t irq = spin_lock_irqsave(&lock);
     bool ok = true;

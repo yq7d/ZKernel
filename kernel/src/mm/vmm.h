@@ -43,6 +43,7 @@ struct address_space {
     uint64_t mmap_next;     // mmap hands out addresses downwards from here
     uint64_t stack_low;     // the stack may grow down to here on faults
     uint64_t stack_top;
+    struct fmap *fmaps;     // lazily filled file mappings, see filemap.h
 };
 
 struct address_space *vmm_create_space(void);

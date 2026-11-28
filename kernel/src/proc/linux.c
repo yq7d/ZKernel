@@ -9,6 +9,7 @@
 #include "kprintf.h"
 #include "console/console.h"
 #include "fs/shmem.h"
+#include "mm/filemap.h"
 #include "proc/sys.h"
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/interrupts.h"
@@ -638,6 +639,7 @@ static uint64_t prot_flags(int prot)
 
 static void unmap_range(struct address_space *as, uint64_t start, uint64_t len)
 {
+    filemap_remove(as, start, len);
     for (uint64_t v = start; v < start + len; v += PAGE_SIZE)
         vmm_free_user(as, v);
 }
@@ -716,6 +718,12 @@ static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, 
         return (int64_t)start;
     }
 
+    // ordinary files fill in on first touch, from the page cache
+    if (f && f->v->type == VNODE_FILE) {
+        int err = filemap_add(as, start, len, f->v, off, prot & 7);
+        return err ? err : (int64_t)start;
+    }
+
     // reservations get no pages, mprotect fills them in later
     if (prot == 0 && !f)
         return (int64_t)start;
@@ -788,10 +796,11 @@ static int64_t l_mprotect(uint64_t addr, uint64_t len, int prot)
     if (addr & (PAGE_SIZE - 1))
         return ZK_EINVAL;
     uint64_t pf = prot_flags(prot);
+    filemap_protect(as, addr, ALIGN_UP(len, PAGE_SIZE), prot & 7);
     for (uint64_t v = addr; v < addr + ALIGN_UP(len, PAGE_SIZE); v += PAGE_SIZE) {
         if (vmm_protect_user(as, v, pf))
             continue;
-        if (prot == 0)
+        if (prot == 0 || filemap_covers(as, v))
             continue;
         // a reservation coming to life
         uint64_t p = pmm_alloc_zeroed();

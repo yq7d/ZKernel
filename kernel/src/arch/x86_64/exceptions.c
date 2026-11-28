@@ -1,3 +1,5 @@
+#include "mm/filemap.h"
+#include "mm/mm.h"
 #include "arch/x86_64/interrupts.h"
 #include "arch/x86_64/cpu.h"
 #include "arch/x86_64/io.h"
@@ -83,10 +85,11 @@ void exception_handle(struct interrupt_frame *f)
         if (t && t->as && vmm_cow_fault(t->as, read_cr2()))
             return;
     }
-    // the user stack grows on demand
+    // file mappings fill in and the user stack grows on demand
     if (vec == 14 && !(f->error_code & 1)) {
         struct thread *t = thread_current();
-        if (t && t->as && vmm_grow_stack(t->as, read_cr2()))
+        if (t && t->as && read_cr2() < USER_LIMIT &&
+            (filemap_fault(t->as, read_cr2(), f->error_code & 2) || vmm_grow_stack(t->as, read_cr2())))
             return;
     }
 
