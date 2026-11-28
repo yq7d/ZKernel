@@ -752,7 +752,7 @@ static int64_t l_mmap(uint64_t addr, uint64_t len, int prot, int flags, int fd, 
 
     // ordinary files fill in on first touch, from the page cache
     if (f && f->v->type == VNODE_FILE) {
-        int err = filemap_add(as, start, len, f->v, off, prot & 7);
+        int err = filemap_add(as, start, len, f->v, off, prot & 7, f->path);
         return err ? err : (int64_t)start;
     }
 

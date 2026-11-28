@@ -255,12 +255,6 @@ static void kmain_late(void)
     virtio_blk_init();
     ahci_init();
     nvme_init();
-    // "nousb" leaves usb to the firmware, its legacy emulation keeps working
-    char nousb[4];
-    if (cmdline_get("nousb", nousb, sizeof nousb))
-        pr_info("usb: left to the firmware (nousb)\n");
-    else
-        xhci_init();
     blk_start_flusher();
     mount_apps();
 
@@ -272,6 +266,15 @@ static void kmain_late(void)
     char fault[16];
     if (cmdline_get("fault", fault, sizeof fault))
         trigger_fault(fault);
+
+    // after the self tests, which count free pages: usb devices being set up
+    // meanwhile would throw them off. "nousb" leaves usb to the firmware,
+    // its legacy emulation keeps working
+    char nousb[4];
+    if (cmdline_get("nousb", nousb, sizeof nousb))
+        pr_info("usb: left to the firmware (nousb)\n");
+    else
+        xhci_init();
 
     pr_ok("boot complete\n");
     run_init();

@@ -31,6 +31,7 @@ struct proc {
     struct vnode *ctty;        // controlling terminal, what /dev/tty opens
     uint64_t cloexec[PROC_MAX_FDS / 64];    // fds closed by exec, one bit each
     char exe[ZK_PATH_MAX];
+    int faults_logged;    // crash reports so far, they're capped
 
     // signals, see signal.h. changed with interrupts off. the mask and
     // the altstack are per thread

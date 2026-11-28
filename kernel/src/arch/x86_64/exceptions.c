@@ -119,6 +119,20 @@ void exception_handle(struct interrupt_frame *f)
         default: sig = SIGSEGV; si.addr = 0; break;
         }
         struct proc *p = t->proc;
+        // the first few crashes of a program go to the log even when it
+        // handles them itself, with the file and offset they happened in
+        if (p && p->faults_logged < 4 && t->as) {
+            p->faults_logged++;
+            char where[80] = "?", what[80] = "";
+            filemap_describe(t->as, f->rip, where, sizeof where);
+            if (vec == 14 && !filemap_describe(t->as, read_cr2(), what, sizeof what))
+                what[0] = '\0';
+            kprintf("crash: %s[%lu] %s at %p (%s)", t->name, p->pid, mn, (void *)f->rip, where);
+            if (vec == 14)
+                kprintf(", address %p%s%s%s, error %#lx", (void *)read_cr2(), what[0] ? " (" : "",
+                        what, what[0] ? ")" : "", f->error_code);
+            kprintf("\n");
+        }
         if (p && p->sigact[sig - 1].handler == SIG_DFL) {
             kprintf("\e[1;31m%s (%lu): %s %s at %p", t->name, t->id, name, mn, (void *)f->rip);
             if (vec == 14)

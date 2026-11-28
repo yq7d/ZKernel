@@ -6,6 +6,7 @@
 #include "fs/vfs.h"
 #include "lib/spinlock.h"
 #include "lib/string.h"
+#include "lib/printf.h"
 #include "mm/heap.h"
 #include "mm/mm.h"
 #include "mm/pmm.h"
@@ -120,13 +121,15 @@ static uint64_t pte_flags(int prot)
 }
 
 int filemap_add(struct address_space *as, uint64_t start, uint64_t len, struct vnode *v,
-                uint64_t off, int prot)
+                uint64_t off, int prot, const char *path)
 {
     struct fmap *m = kmalloc(sizeof *m);
     if (!m)
         return ZK_ENOMEM;
     vnode_get(v);
-    *m = (struct fmap){ start, start + len, v, off, prot, NULL };
+    *m = (struct fmap){ start, start + len, v, off, prot, "", NULL };
+    const char *base = path ? strrchr(path, '/') : NULL;
+    strlcpy(m->name, base ? base + 1 : path ? path : "?", sizeof m->name);
     uint64_t irq = spin_lock_irqsave(&map_lock);
     m->next = as->fmaps;
     as->fmaps = m;
@@ -194,6 +197,20 @@ void filemap_protect(struct address_space *as, uint64_t start, uint64_t len, int
             m->prot = prot;
     }
     spin_unlock_irqrestore(&map_lock, irq);
+}
+
+bool filemap_describe(struct address_space *as, uint64_t addr, char *out, size_t size)
+{
+    bool found = false;
+    uint64_t irq = spin_lock_irqsave(&map_lock);
+    for (struct fmap *m = as->fmaps; m && !found; m = m->next) {
+        if (addr >= m->start && addr < m->end) {
+            snprintf(out, size, "%s+%#lx", m->name, m->off + (addr - m->start));
+            found = true;
+        }
+    }
+    spin_unlock_irqrestore(&map_lock, irq);
+    return found;
 }
 
 bool filemap_covers(struct address_space *as, uint64_t addr)
