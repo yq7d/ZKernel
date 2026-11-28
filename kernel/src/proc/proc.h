@@ -13,7 +13,7 @@
 #define PROC_MAX_ARGS 64
 #define PROC_MAX_ENV  64
 #define PROC_MAX_ARG_BYTES (32 * 1024)
-#define PROC_MAX_EXEC (16UL << 20)
+#define PROC_MAX_EXEC (256UL << 20)    // gcc's cc1 alone is around 40 MiB
 
 struct file;
 

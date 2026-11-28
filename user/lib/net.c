@@ -16,6 +16,21 @@ static inline long syscall6(long n, long a, long b, long c, long d, long e, long
 
 int socket(int domain, int type) { return (int)syscall6(SYS_SOCKET, domain, type, 0, 0, 0, 0); }
 int connect(int fd, const struct zk_sockaddr_in *a) { return (int)syscall6(SYS_CONNECT, fd, (long)a, sizeof *a, 0, 0, 0); }
+
+int connect_unix(const char *path)
+{
+    struct { uint16_t family; char path[108]; } sa = { 1, "" };
+    strlcpy(sa.path, path, sizeof sa.path);
+    int fd = socket(1, 1);    // AF_UNIX, SOCK_STREAM
+    if (fd < 0)
+        return fd;
+    int err = (int)syscall6(SYS_CONNECT, fd, (long)&sa, sizeof sa, 0, 0, 0);
+    if (err < 0) {
+        close(fd);
+        return err;
+    }
+    return fd;
+}
 int bind(int fd, const struct zk_sockaddr_in *a) { return (int)syscall6(SYS_BIND, fd, (long)a, sizeof *a, 0, 0, 0); }
 long sendto(int fd, const void *buf, size_t len, const struct zk_sockaddr_in *a)
 {

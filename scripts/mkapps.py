@@ -102,13 +102,17 @@ def resolve(want, pkgs, providers):
     return order
 
 
-def extract(apk, root):
+def extract(apk, root, skipped):
     with open(apk, "rb") as f:
         data = gzip.decompress(f.read())    # all the members back to back
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:", ignore_zeros=True) as t:
         for m in t:
-            if m.name.startswith(".") or m.name.startswith(SKIP_FILES):
+            if m.name.startswith("."):
                 continue    # .PKGINFO, .SIGN, scripts
+            if m.name.startswith(SKIP_FILES):
+                if m.isfile():    # kept aside, its symbols make the stub
+                    t.extract(m, skipped, set_attrs=False, filter="fully_trusted")
+                continue
             try:
                 t.extract(m, root, set_attrs=False, filter="fully_trusted")
             except (OSError, tarfile.TarError) as e:
@@ -119,6 +123,41 @@ def extract(apk, root):
                 os.chmod(os.path.join(root, m.name), m.mode & 0o7777)
 
 
+# libGL and libEGL link libgallium, which drags in llvm. programs that link
+# libGL (xvfb) only need it to load, so it's replaced by a library with the
+# same symbols and empty bodies, built here from the real one's symbol table
+def stub_gallium(root, skipped):
+    import glob, tempfile
+    for real in glob.glob(os.path.join(skipped, "usr/lib/libgallium*.so")):
+        name = os.path.basename(real)
+        syms = subprocess.run(["readelf", "--dyn-syms", "-W", real], capture_output=True,
+                              text=True).stdout.splitlines()
+        lines = []
+        for l in syms:
+            f = l.split()
+            if len(f) < 8 or f[6] in ("UND", "ABS") or f[4] not in ("GLOBAL", "WEAK"):
+                continue
+            sym = f[7].split("@")[0]
+            if not sym.replace("_", "a").replace(".", "a").isalnum():
+                continue    # version tags and the like
+            n = len(lines)
+            # any name goes through as an asm label
+            if f[3] == "FUNC":
+                lines.append(f'void s{n}(void) __asm__("{sym}"); void s{n}(void) {{}}')
+            elif f[3] == "OBJECT":
+                lines.append(f'char s{n}[{max(int(f[2], 0), 1)}] __asm__("{sym}");')
+            elif f[3] == "TLS":
+                lines.append(f'__thread char s{n}[{max(int(f[2], 0), 1)}] __asm__("{sym}");')
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "stub.c")
+            open(src, "w").write("\n".join(lines) + "\n")
+            out = os.path.join(root, "usr/lib", name)
+            r = subprocess.run(["gcc", "-shared", "-fPIC", "-nostdlib", "-O0", "-w",
+                                f"-Wl,-soname,{name}", "-o", out, src])
+            if r.returncode == 0:
+                print(f"mkapps: stub {name}, {len(lines)} symbols")
+
+
 def main():
     out, cache, want = sys.argv[1], sys.argv[2], sys.argv[3:]
     os.makedirs(cache, exist_ok=True)
@@ -127,8 +166,11 @@ def main():
     print(f"mkapps: {len(names)} packages")
 
     root = out + ".root"
+    skipped = out + ".skipped"
     shutil.rmtree(root, ignore_errors=True)
+    shutil.rmtree(skipped, ignore_errors=True)
     os.makedirs(root)
+    os.makedirs(skipped)
     for n in names:
         p = pkgs[n]
         file = f"{n}-{p['version']}.apk"
@@ -136,7 +178,7 @@ def main():
         if not (os.path.exists(path) and os.path.getsize(path) == p.get("size", -1)):
             print(f"mkapps: getting {file}")
             fetch(f"{MIRROR}/{p['repo']}/{ARCH}/{file}", path)
-        extract(path, root)
+        extract(path, root, skipped)
 
     # what install scripts and triggers would have done
     applets = os.path.join(root, "etc/busybox-paths.d/busybox")
@@ -149,6 +191,8 @@ def main():
     schemas = os.path.join(root, "usr/share/glib-2.0/schemas")
     if os.path.isdir(schemas) and shutil.which("glib-compile-schemas"):
         subprocess.run(["glib-compile-schemas", schemas], check=False)
+    stub_gallium(root, skipped)
+    shutil.rmtree(skipped, ignore_errors=True)
     for d in ("tmp", "var/tmp", "var/cache/fontconfig", "var/lib/xkb"):
         os.makedirs(os.path.join(root, d), exist_ok=True)
     # there's no font cache (it would take running alpine's fc-cache), so

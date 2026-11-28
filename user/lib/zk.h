@@ -102,6 +102,8 @@ int lstat(const char *path, struct zk_stat *st);
 // networking. addresses are host byte order except inside zk_sockaddr_in
 int socket(int domain, int type);
 int connect(int fd, const struct zk_sockaddr_in *a);
+// a stream socket connected to a unix socket path
+int connect_unix(const char *path);
 int bind(int fd, const struct zk_sockaddr_in *a);
 long sendto(int fd, const void *buf, size_t len, const struct zk_sockaddr_in *a);
 long recvfrom(int fd, void *buf, size_t len, struct zk_sockaddr_in *a);

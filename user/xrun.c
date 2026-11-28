@@ -1,11 +1,12 @@
 // xrun prog [args]: runs an x program from anywhere. under x it just runs
-// it. from zwm it asks init for an x session with the program in it and
-// closes zwm, init brings zwm back once the program exits. from a text
-// console it starts x itself. installed as firefox too
+// it. in zwm it asks zwm for its x display, a window zwm draws an xvfb
+// screen into, waits for that server and runs the program on it. from a
+// text console it starts x itself. installed as firefox too
 #include "zk.h"
 
-#define REQUEST "/tmp/.zos-xsession"
-#define ZWM_PID "/tmp/.zwm.pid"
+#define ZWM_PID  "/tmp/.zwm.pid"
+#define ZWM_XREQ "/tmp/.zwm-xdisplay"
+#define X1_SOCK  "/tmp/.X11-unix/X1"
 
 static const char *const roots[] = { "/compat/linux", "/compat/apps" };
 static const char *const dirs[] = { "/usr/bin", "/bin", "/usr/local/bin" };
@@ -68,26 +69,35 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // the command line, for the x session to run
+    // in zwm: its x display, started on demand
+    if (zwm_pid() > 0) {
+        struct zk_stat st;
+        if (stat(X1_SOCK, &st) != 0) {
+            int fd = open(ZWM_XREQ, O_WRONLY | O_CREAT | O_TRUNC);
+            if (fd < 0) {
+                printf("xrun: can't ask zwm for an x display\n");
+                return 1;
+            }
+            close(fd);
+            printf("starting the x display...\n");
+            for (int i = 0; i < 300 && stat(X1_SOCK, &st) != 0; i++)
+                sleep_ms(100);
+            if (stat(X1_SOCK, &st) != 0) {
+                printf("xrun: the x display didn't come up, see /tmp/Xvfb.log\n");
+                return 1;
+            }
+        }
+        setenv("DISPLAY", ":1", 1);
+        int err = execv(path, argv + first);
+        printf("xrun: %s: %s\n", path, strerror(err));
+        return 1;
+    }
+
+    // the command line, for startx to run
     char cmd[1024] = "";
     size_t n = 0;
     for (int i = first; i < argc && n < sizeof cmd - 2; i++)
         n += (size_t)snprintf(cmd + n, sizeof cmd - n, "%s%s", i > first ? " " : "", argv[i]);
-
-    long pid = zwm_pid();
-    if (pid > 0) {
-        int fd = open(REQUEST, O_WRONLY | O_CREAT | O_TRUNC);
-        if (fd < 0) {
-            printf("xrun: can't write %s\n", REQUEST);
-            return 1;
-        }
-        dprintf(fd, "%s\n", cmd);
-        close(fd);
-        printf("switching to x for %s, zwm comes back when it closes\n", cmd);
-        unlink(ZWM_PID);
-        kill(pid);
-        return 0;
-    }
 
     // a text console: x right here
     setenv("ZOS_XAPP", cmd, 1);

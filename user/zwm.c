@@ -11,6 +11,9 @@
 //   super+shift+r       reload the config
 //   super+shift+e       quit
 //
+// x programs (firefox, xrun prog) show up in an "x display" window: an
+// xvfb screen zwm draws in and types and clicks into through xtest
+//
 // settings come from /etc/zwm.conf, then ~/.config/zwm/zwm.conf on top
 //
 // alt works as the modifier too, host desktops often keep super for themselves
@@ -106,6 +109,7 @@ struct term {
     char osc[64];
     int osc_len;
     bool dirty;
+    bool xwin;               // the x display, not a terminal
 };
 
 static struct term terms[MAX_TERMS];
@@ -700,6 +704,8 @@ static void resize_term(struct term *t, int w, int h)
     t->x = 0;
     t->w = w;
     t->h = h;
+    if (t->xwin)
+        return;
     int cols = (w - 2 * cfg.border - 2 * PAD) / fw;
     int rows = (h - 2 * cfg.border - TITLE_H - 2 * PAD) / fh;
     if (cols < 2) cols = 2;
@@ -793,6 +799,25 @@ static void focus_any(void)
     bar_dirty = true;
 }
 
+// new windows become the master
+static void add_window(int idx)
+{
+    memmove(order + 1, order, (size_t)nterms * sizeof(int));
+    order[0] = idx;
+    nterms++;
+    focus = idx;
+    fullscreen = -1;
+    layout();
+}
+
+static int free_slot(void)
+{
+    for (int i = 0; i < MAX_TERMS; i++)
+        if (!terms[i].used)
+            return i;
+    return -1;
+}
+
 // a terminal running cmd through the shell, which stays afterwards
 static void spawn_term_cmd(const char *cmd);
 
@@ -840,13 +865,7 @@ static void spawn_term_cmd(const char *cmd)
         return;
     }
 
-    // new windows become the master
-    memmove(order + 1, order, (size_t)nterms * sizeof(int));
-    order[0] = idx;
-    nterms++;
-    focus = idx;
-    fullscreen = -1;
-    layout();
+    add_window(idx);
 }
 
 static void remove_term(int idx)
@@ -854,7 +873,8 @@ static void remove_term(int idx)
     struct term *t = &terms[idx];
     if (!t->used)
         return;
-    close(t->master);
+    if (t->master >= 0)
+        close(t->master);
     free(t->cells);
     t->used = false;
     int k = pos_in_order(idx);
@@ -954,6 +974,219 @@ static void send_to_ws(int ws)
 
 // drawing
 
+// the x display
+
+#define X_REQ  "/tmp/.zwm-xdisplay"
+#define X_SOCK "/tmp/.X11-unix/X1"
+#define X_FB   "/dev/shm/Xvfb_screen0"
+
+static long xvfb_pid = -1;
+static int xconn = -1, xfb = -1;
+static uint8_t xtest_op;
+static uint32_t xfb_w, xfb_h, xfb_bpl, xfb_off;
+static uint8_t *xfb_buf;
+static uint64_t xframe_at, xtry_at;
+static uint8_t xbuttons;
+
+static uint32_t be32(const uint8_t *p)
+{
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+static bool read_full(int fd, void *buf, size_t n)
+{
+    size_t got = 0;
+    while (got < n) {
+        long r = read(fd, (uint8_t *)buf + got, n - got);
+        if (r <= 0)
+            return false;
+        got += (size_t)r;
+    }
+    return true;
+}
+
+static int x_window(void)
+{
+    for (int i = 0; i < MAX_TERMS; i++)
+        if (terms[i].used && terms[i].xwin)
+            return i;
+    return -1;
+}
+
+// xvfb with the screen the size of the work area, and a window showing it
+static void x_start(void)
+{
+    if (xvfb_pid > 0)
+        return;
+    static const char *const where[] = { "/compat/linux/usr/bin/Xvfb", "/compat/apps/usr/bin/Xvfb" };
+    const char *path = NULL;
+    struct zk_stat st;
+    for (int i = 0; i < 2 && !path; i++)
+        if (stat(where[i], &st) == 0)
+            path = where[i];
+    int idx = free_slot();
+    if (!path || idx < 0)
+        return;
+    // a server killed earlier leaves these behind
+    unlink("/tmp/.X1-lock");
+    unlink(X_SOCK);
+    char geo[32];
+    snprintf(geo, sizeof geo, "%dx%dx24", screen.w, screen.h - BAR_H);
+    char *argv[] = { "Xvfb", ":1", "-screen", "0", geo, "-fbdir", "/dev/shm", "-extension", "GLX",
+                     "-nolisten", "tcp", "-noreset", NULL };
+    int log = open("/tmp/Xvfb.log", O_WRONLY | O_CREAT | O_TRUNC);
+    struct zk_spawn opts = { { log, log, log }, 0 };
+    xvfb_pid = spawn(path, argv, &opts);
+    if (log >= 0)
+        close(log);
+    if (xvfb_pid < 0)
+        return;
+
+    struct term *t = &terms[idx];
+    memset(t, 0, sizeof(*t));
+    t->used = true;
+    t->xwin = true;
+    t->master = -1;
+    t->pid = xvfb_pid;
+    t->ws = cur_ws;
+    strlcpy(t->title, "x display", sizeof t->title);
+    add_window(idx);
+}
+
+// our own connection, for xtest, and the screen's file
+static void x_connect(void)
+{
+    if (xvfb_pid < 0 || xconn >= 0 || uptime_ms() < xtry_at)
+        return;
+    xtry_at = uptime_ms() + 250;
+    int fd = connect_unix(X_SOCK);
+    if (fd < 0)
+        return;
+    uint8_t setup[12] = { 'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    uint8_t hdr[8];
+    if (write(fd, setup, sizeof setup) != sizeof setup || !read_full(fd, hdr, 8) || hdr[0] != 1) {
+        close(fd);
+        return;
+    }
+    size_t extra = (size_t)(hdr[6] | hdr[7] << 8) * 4;
+    uint8_t junk[512];
+    while (extra) {
+        size_t n = extra < sizeof junk ? extra : sizeof junk;
+        if (!read_full(fd, junk, n)) {
+            close(fd);
+            return;
+        }
+        extra -= n;
+    }
+    uint8_t q[16] = { 98, 0, 4, 0, 5, 0, 0, 0, 'X', 'T', 'E', 'S', 'T', 0, 0, 0 };    // QueryExtension
+    uint8_t r[32];
+    if (write(fd, q, sizeof q) != sizeof q || !read_full(fd, r, 32) || r[0] != 1 || !r[8]) {
+        close(fd);
+        return;
+    }
+    xtest_op = r[9];
+    xconn = fd;
+
+    xfb = open(X_FB, O_RDONLY);
+    uint8_t h[100];
+    if (xfb >= 0 && read(xfb, h, sizeof h) == sizeof h) {
+        xfb_w = be32(h + 16);
+        xfb_h = be32(h + 20);
+        xfb_bpl = be32(h + 48);
+        xfb_off = be32(h) + be32(h + 76) * 12;    // header, then the colormap
+        free(xfb_buf);
+        xfb_buf = malloc((size_t)xfb_bpl * xfb_h);
+    }
+}
+
+static void x_stop(void)
+{
+    if (xconn >= 0)
+        close(xconn);
+    if (xfb >= 0)
+        close(xfb);
+    xconn = xfb = -1;
+    xvfb_pid = -1;
+}
+
+// an xtest FakeInput: key or button press/release, or motion to x,y
+static void x_input(uint8_t type, uint8_t detail, int x, int y)
+{
+    if (xconn < 0)
+        return;
+    uint8_t r[36] = { 0 };
+    r[0] = xtest_op;
+    r[1] = 2;
+    r[2] = 9;
+    r[4] = type;
+    r[5] = detail;
+    r[24] = (uint8_t)x;
+    r[25] = (uint8_t)(x >> 8);
+    r[26] = (uint8_t)y;
+    r[27] = (uint8_t)(y >> 8);
+    write(xconn, r, sizeof r);
+}
+
+// set 1 scancodes (0x80 for e0 ones) to linux keycodes, which x uses plus 8
+static int linux_key(uint16_t code)
+{
+    if (!(code & 0x80))
+        return code <= 0x58 ? code : 0;
+    switch (code & 0x7F) {
+    case 0x1C: return 96;
+    case 0x1D: return 97;
+    case 0x35: return 98;
+    case 0x37: return 99;
+    case 0x38: return 100;
+    case 0x47: return 102;
+    case 0x48: return 103;
+    case 0x49: return 104;
+    case 0x4B: return 105;
+    case 0x4D: return 106;
+    case 0x4F: return 107;
+    case 0x50: return 108;
+    case 0x51: return 109;
+    case 0x52: return 110;
+    case 0x53: return 111;
+    case 0x5B: return 125;
+    case 0x5C: return 126;
+    case 0x5D: return 127;
+    }
+    return 0;
+}
+
+static void x_key(const struct zk_key_event *e)
+{
+    int k = linux_key(e->code);
+    if (k)
+        x_input(e->pressed ? 2 : 3, (uint8_t)(k + 8), 0, 0);
+}
+
+static void draw_xwin(struct term *t, int x0, int y0, int w, int h)
+{
+    if (xfb < 0 || !xfb_buf) {
+        gfx_text(&screen, &font, x0 + 12, y0 + 12, "starting x...", col(cfg.dim), GFX_CLEAR, 1);
+        return;
+    }
+    int rows = h < (int)xfb_h ? h : (int)xfb_h;
+    int cols = w < (int)xfb_w ? w : (int)xfb_w;
+    seek(xfb, xfb_off, 0);
+    if (read(xfb, xfb_buf, (size_t)rows * xfb_bpl) <= 0)
+        return;
+    bool native = fbi.red_shift == 16 && fbi.green_shift == 8 && fbi.blue_shift == 0;
+    for (int y = 0; y < rows; y++) {
+        uint32_t *src = (uint32_t *)(xfb_buf + (size_t)y * xfb_bpl);
+        uint32_t *dst = screen.px + (size_t)(y0 + y) * screen.stride + x0;
+        if (native) {
+            memcpy(dst, src, (size_t)cols * 4);
+        } else {
+            for (int x = 0; x < cols; x++)
+                dst[x] = col(src[x] & 0xFFFFFF);
+        }
+    }
+    (void)t;
+}
+
 static void draw_term(struct term *t, bool focused)
 {
     uint32_t edge = col(focused ? cfg.accent : cfg.inactive);
@@ -966,6 +1199,11 @@ static void draw_term(struct term *t, bool focused)
 
     int cx0 = ix, cy0 = iy + TITLE_H, cw = iw, ch = t->h - 2 * cfg.border - TITLE_H;
     gfx_fill(&screen, cx0, cy0, cw, ch, col(cfg.term_bg));
+    if (t->xwin) {
+        draw_xwin(t, cx0, cy0, cw, ch);
+        t->dirty = false;
+        return;
+    }
     int ox = cx0 + PAD, oy = cy0 + PAD;
     for (int y = 0; y < t->rows; y++) {
         for (int x = 0; x < t->cols; x++) {
@@ -1192,6 +1430,10 @@ static void key_to_term(const struct zk_key_event *e)
     if (focus < 0)
         return;
     struct term *t = &terms[focus];
+    if (t->xwin) {
+        x_key(e);
+        return;
+    }
     switch (e->key) {
     case ZK_KEY_UP:     send(t, "\e[A", 3); return;
     case ZK_KEY_DOWN:   send(t, "\e[B", 3); return;
@@ -1217,8 +1459,11 @@ static bool running = true;
 
 static void handle_key(const struct zk_key_event *e)
 {
-    if (!e->pressed)
+    if (!e->pressed) {
+        if (focus >= 0 && terms[focus].xwin)
+            x_key(e);
         return;
+    }
     bool mod = e->mods & cfg.mods;
     bool shift = e->mods & KEYMOD_SHIFT;
     uint16_t c = e->code;
@@ -1325,6 +1570,22 @@ static void handle_mouse(const struct zk_mouse_event *e)
     if (e->dx || e->dy)
         pointer_moved = true;
 
+    // over the x display: motion and buttons go to x
+    int over = term_at(mouse_x, mouse_y);
+    if (over >= 0 && terms[over].xwin) {
+        struct term *t = &terms[over];
+        int cx = mouse_x - t->x - cfg.border, cy = mouse_y - t->y - cfg.border - TITLE_H;
+        if (cy >= 0) {
+            if (e->dx || e->dy)
+                x_input(6, 0, cx, cy);
+            static const uint8_t bits[3] = { MOUSE_LEFT, MOUSE_MIDDLE, MOUSE_RIGHT };
+            for (int b = 0; b < 3; b++)
+                if ((e->buttons ^ xbuttons) & bits[b])
+                    x_input(e->buttons & bits[b] ? 4 : 5, (uint8_t)(b + 1), 0, 0);
+            xbuttons = e->buttons;
+        }
+    }
+
     bool left_down = (e->buttons & MOUSE_LEFT) && !(mouse_buttons & MOUSE_LEFT);
     mouse_buttons = e->buttons;
     if (!left_down)
@@ -1367,7 +1628,7 @@ static void update_titles(void)
         return;
     for (int i = 0; i < MAX_TERMS; i++) {
         struct term *t = &terms[i];
-        if (!t->used)
+        if (!t->used || t->xwin)
             continue;
         uint64_t fg = 0;
         ioctl(t->master, TIOCGFG, (uint64_t)&fg);
@@ -1391,10 +1652,13 @@ static void reap(void)
 {
     int status;
     long pid;
-    while ((pid = wait(-1, &status, WNOHANG)) > 0)
+    while ((pid = wait(-1, &status, WNOHANG)) > 0) {
+        if (pid == xvfb_pid)
+            x_stop();
         for (int i = 0; i < MAX_TERMS; i++)
             if (terms[i].used && terms[i].pid == pid)
                 remove_term(i);
+    }
 }
 
 int main(void)
@@ -1454,8 +1718,8 @@ int main(void)
     uint64_t last_tick = 0;
     static char buf[READ_CHUNK];
     while (running) {
-        struct zk_pollfd fds[2 + MAX_TERMS];
-        int map[2 + MAX_TERMS];
+        struct zk_pollfd fds[3 + MAX_TERMS];
+        int map[3 + MAX_TERMS];
         int n = 0;
         fds[n++] = (struct zk_pollfd){ kbd, POLLIN, 0 };
         if (mouse >= 0)
@@ -1468,7 +1732,31 @@ int main(void)
             }
         }
 
-        poll(fds, (size_t)n, 1000);
+        int end_term = n;
+        // the x connection only ever brings errors and events we don't use
+        int xslot = -1;
+        if (xconn >= 0) {
+            xslot = n;
+            fds[n++] = (struct zk_pollfd){ xconn, POLLIN, 0 };
+        }
+        int xw = x_window();
+        poll(fds, (size_t)n, xw >= 0 || xvfb_pid > 0 ? 50 : 1000);
+        if (xslot >= 0 && (fds[xslot].revents & (POLLIN | POLLHUP))) {
+            if (read(xconn, buf, sizeof buf) <= 0)
+                x_stop();
+        }
+
+        // xrun asking for the x display
+        struct zk_stat xst;
+        if (stat(X_REQ, &xst) == 0) {
+            unlink(X_REQ);
+            x_start();
+        }
+        x_connect();
+        if (xw >= 0 && visible(xw) && uptime_ms() >= xframe_at) {
+            terms[xw].dirty = true;
+            xframe_at = uptime_ms() + 66;
+        }
 
         if (fds[0].revents & POLLIN) {
             struct zk_key_event ev[16];
@@ -1482,7 +1770,7 @@ int main(void)
             for (long k = 0; k < got / (long)sizeof ev[0]; k++)
                 handle_mouse(&ev[k]);
         }
-        for (int k = first_term; k < n; k++) {
+        for (int k = first_term; k < end_term; k++) {
             int i = map[k];
             if (!terms[i].used || terms[i].master != fds[k].fd)
                 continue;    // closed by a key above

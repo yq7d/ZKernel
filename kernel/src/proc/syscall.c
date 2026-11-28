@@ -1,3 +1,4 @@
+#include "net/unix.h"
 #include "proc/proc.h"
 #include "proc/sys.h"
 #include "arch/x86_64/cpu.h"
@@ -672,8 +673,14 @@ static void syscall_handler(struct interrupt_frame *f)
             ret = copy_out(b, &st, sizeof st);
         break;
     }
-    case SYS_SOCKET:     ret = sys_socket((int)a, (int)b); break;
-    case SYS_CONNECT:    ret = sys_connect((int)a, b, (uint32_t)c); break;
+    // unix sockets go through the linux implementation, same addresses
+    case SYS_SOCKET:     ret = (int)a == 1 ? unix_socket((int)b, 0) : sys_socket((int)a, (int)b); break;
+    case SYS_CONNECT: {
+        struct file *sf = proc_fd_get(proc_current(), (int)a);
+        ret = sf && unix_is_socket(sf) ? unix_call(sf, 42, b, c, 0, 0, 0)
+                                       : sys_connect((int)a, b, (uint32_t)c);
+        break;
+    }
     case SYS_BIND:       ret = sys_bind((int)a, b, (uint32_t)c); break;
     case SYS_SENDTO:     ret = sys_sendto((int)a, b, c, (int)d, e, (uint32_t)g); break;
     case SYS_RECVFROM:   ret = sys_recvfrom((int)a, b, c, (int)d, e, g); break;

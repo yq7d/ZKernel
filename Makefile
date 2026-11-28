@@ -63,7 +63,7 @@ USER_LIB     := $(BUILD)/user/lib/crt0.asm.o $(BUILD)/user/lib/zk.o $(BUILD)/use
 DISK := disk.img
 
 APPS ?= xorg-server xf86-video-fbdev xf86-input-evdev twm xterm xsetroot xeyes \
-        font-misc-misc font-dejavu firefox ca-certificates
+        font-misc-misc font-dejavu firefox ca-certificates xvfb
 APPS_IMG := $(if $(strip $(APPS)),$(BUILD)/apps.img)
 
 .PHONY: all run run-uefi vbox debug clean disk FORCE
