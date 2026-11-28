@@ -50,6 +50,7 @@ struct fat_node {
     bool unlinked;        // clusters get freed when the last reference goes
     uint32_t cur_idx, cur_clus;    // last cluster walked to, for sequential io
     struct fat_node *next;
+    int releasing;    // release calls waiting for the lock
 };
 
 // one directory entry as found by a scan
@@ -1101,7 +1102,14 @@ static void release(struct vnode *v)
 {
     struct fat_node *n = NODE(v);
     struct fat_sb *sb = n->sb;
+    // the node can be found and handed out again while we wait, see ext2
+    __atomic_add_fetch(&n->releasing, 1, __ATOMIC_ACQ_REL);
     mutex_lock(&sb->lock);
+    if (__atomic_sub_fetch(&n->releasing, 1, __ATOMIC_ACQ_REL) > 0 ||
+        __atomic_load_n(&n->v.refs, __ATOMIC_ACQUIRE) > 0) {
+        unlock(sb);
+        return;
+    }
     for (struct fat_node **p = &sb->nodes; *p; p = &(*p)->next) {
         if (*p == n) {
             *p = n->next;

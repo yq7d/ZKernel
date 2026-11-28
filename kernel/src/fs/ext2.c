@@ -57,6 +57,7 @@ struct enode {
     uint32_t ino;
     struct inode in;
     bool unlinked;
+    int releasing;    // e_release calls waiting for the lock
     struct enode *next;
 };
 
@@ -1036,7 +1037,16 @@ static void e_release(struct vnode *v)
 {
     struct enode *n = EN(v);
     struct sb *s = n->sb;
+    // get_node can hand the node out again while we wait for the lock, and
+    // it can drop to zero again too. only the last waiter frees, and only if
+    // nobody picked it up in the meantime
+    __atomic_add_fetch(&n->releasing, 1, __ATOMIC_ACQ_REL);
     mutex_lock(&s->lock);
+    if (__atomic_sub_fetch(&n->releasing, 1, __ATOMIC_ACQ_REL) > 0 ||
+        __atomic_load_n(&n->v.refs, __ATOMIC_ACQUIRE) > 0) {
+        mutex_unlock(&s->lock);
+        return;
+    }
     for (struct enode **pp = &s->nodes; *pp; pp = &(*pp)->next) {
         if (*pp == n) {
             *pp = n->next;
