@@ -34,6 +34,11 @@ uint16_t pci_read16(const struct pci_dev *d, uint8_t off)
     return (uint16_t)(pci_read32(d, off) >> ((off & 2) * 8));
 }
 
+void pci_write32(const struct pci_dev *d, uint8_t off, uint32_t v)
+{
+    cfg_write(d->bus, d->dev, d->fn, off, v);
+}
+
 void pci_write16(const struct pci_dev *d, uint8_t off, uint16_t v)
 {
     uint32_t old = pci_read32(d, off);

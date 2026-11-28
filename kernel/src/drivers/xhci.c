@@ -693,6 +693,23 @@ static void take_over(struct hc *h, uint32_t hcc)
     }
 }
 
+// intel 7, 8 and 9 series chipsets (thinkcentre m72/m73/m93 and friends)
+// start with the usb 2 ports on the ehci controller. this moves every port
+// the firmware allows over to xhci, the way linux does
+static void intel_route_ports(const struct pci_dev *pd)
+{
+    static const uint16_t ids[] = { 0x1E31, 0x8C31, 0x9C31, 0x9CB1, 0x8CB1 };
+    if (pd->vendor != 0x8086)
+        return;
+    bool known = false;
+    for (unsigned i = 0; i < sizeof ids / sizeof ids[0]; i++)
+        known |= pd->device == ids[i];
+    if (!known)
+        return;
+    pci_write32(pd, 0xD8, pci_read32(pd, 0xDC));    // usb 3 superspeed enable
+    pci_write32(pd, 0xD0, pci_read32(pd, 0xD4));    // usb 2 ports to xhci
+}
+
 static bool start(const struct pci_dev *pd)
 {
     bool io;
@@ -777,6 +794,7 @@ static bool start(const struct pci_dev *pd)
     for (int p = 1; p <= h->ports; p++)
         if (!(*portsc(h, p) & PORT_PP))
             port_write(h, p, PORT_PP);
+    intel_route_ports(pd);
     hcs[nhc++] = h;
     pr_ok("usb: xhci %02x:%02x.%x, %d ports\n", pd->bus, pd->dev, pd->fn, h->ports);
     return true;

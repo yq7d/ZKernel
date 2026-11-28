@@ -18,6 +18,7 @@ const struct pci_dev *pci_find(uint16_t vendor, uint16_t device, const struct pc
 uint32_t pci_read32(const struct pci_dev *d, uint8_t off);
 uint16_t pci_read16(const struct pci_dev *d, uint8_t off);
 void pci_write16(const struct pci_dev *d, uint8_t off, uint16_t v);
+void pci_write32(const struct pci_dev *d, uint8_t off, uint32_t v);
 // io or memory base of a bar, with the flag bits stripped
 uint64_t pci_bar(const struct pci_dev *d, int bar, bool *is_io);
 void pci_enable(const struct pci_dev *d);    // io, memory and bus mastering
