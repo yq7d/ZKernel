@@ -644,7 +644,13 @@ int vfs_mkdir(const char *path)
     int err = lookup_parent(path, &dir, name);
     if (err)
         return err;
-    err = vfs_permission(dir, MAY_WRITE | MAY_EXEC);
+    // an existing name is EEXIST even where we couldn't write, mkdir -p counts on it
+    if (dir->ops->lookup && dir->ops->lookup(dir, name, &v) == 0) {
+        vnode_put(v);
+        err = ZK_EEXIST;
+    } else {
+        err = vfs_permission(dir, MAY_WRITE | MAY_EXEC);
+    }
     if (!err)
         err = dir->ops->create(dir, name, VNODE_DIR, &v);
     vnode_put(dir);

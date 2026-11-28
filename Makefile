@@ -48,7 +48,7 @@ USER_PROGS   := hello spin fault guess sh ls cat echo mkdir rm wc ps kill utest 
                 uptime free clear date df mount umount sync reboot poweroff which \
                 env pwd hostname du find xargs printf init zwm \
                 id whoami sudo su passwd chmod chown ifconfig ping host fetch pkg zfetch \
-                mkfs.fat mkfs.ext2 zos-install
+                mkfs.fat mkfs.ext2 zos-install startx
 USER_BINS    := $(USER_PROGS:%=$(BUILD)/user/%.elf)
 USER_LIB     := $(BUILD)/user/lib/crt0.asm.o $(BUILD)/user/lib/zk.o $(BUILD)/user/lib/malloc.o $(BUILD)/user/lib/env.o $(BUILD)/user/lib/util.o \
                 $(BUILD)/user/lib/sha256.o $(BUILD)/user/lib/users.o $(BUILD)/user/lib/net.o \
