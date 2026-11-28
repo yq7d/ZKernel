@@ -149,28 +149,42 @@ static void input_dev(struct evdev *d, int n, const char *serio)
     slink(tmp, p);
 }
 
+// under the vga card when there is one, like a real gpu's framebuffer. xorg's
+// fbdev driver finds it through the pci device
 static void framebuffer(void)
 {
-    const char *b = "/sys/devices/platform/simple-framebuffer.0/graphics/fb0";
-    char p[160];
-    snprintf(p, sizeof p, "%s/dev", b);
+    char b[128], p[192], rel[160];
+    const struct pci_dev *vga = NULL;
+    for (int i = 0; i < pci_count() && !vga; i++)
+        if (pci_get(i)->class == 3)
+            vga = pci_get(i);
+    if (vga)
+        snprintf(b, sizeof b, "devices/pci0000:00/0000:%02x:%02x.%x/graphics/fb0",
+                 vga->bus, vga->dev, vga->fn);
+    else
+        snprintf(b, sizeof b, "devices/platform/simple-framebuffer.0/graphics/fb0");
+
+    snprintf(p, sizeof p, "/sys/%s/dev", b);
     put(p, "29:0\n");
-    snprintf(p, sizeof p, "%s/uevent", b);
+    snprintf(p, sizeof p, "/sys/%s/uevent", b);
     put(p, "MAJOR=29\nMINOR=0\nDEVNAME=fb0\n");
-    snprintf(p, sizeof p, "%s/name", b);
+    snprintf(p, sizeof p, "/sys/%s/name", b);
     put(p, "zkfb\n");
-    snprintf(p, sizeof p, "%s/bits_per_pixel", b);
+    snprintf(p, sizeof p, "/sys/%s/bits_per_pixel", b);
     put(p, "32\n");
-    snprintf(p, sizeof p, "%s/virtual_size", b);
+    snprintf(p, sizeof p, "/sys/%s/virtual_size", b);
     put(p, "%u,%u\n", (unsigned)fb.width, (unsigned)fb.height);
-    snprintf(p, sizeof p, "%s/stride", b);
+    snprintf(p, sizeof p, "/sys/%s/stride", b);
     put(p, "%u\n", (unsigned)fb.pitch);
-    snprintf(p, sizeof p, "%s/modes", b);
+    snprintf(p, sizeof p, "/sys/%s/modes", b);
     put(p, "U:%ux%up-60\n", (unsigned)fb.width, (unsigned)fb.height);
-    snprintf(p, sizeof p, "%s/subsystem", b);
+    snprintf(p, sizeof p, "/sys/%s/subsystem", b);
     slink("../../../../../class/graphics", p);
-    slink("../../devices/platform/simple-framebuffer.0/graphics/fb0", "/sys/class/graphics/fb0");
-    slink("../../devices/platform/simple-framebuffer.0/graphics/fb0", "/sys/dev/char/29:0");
+    snprintf(p, sizeof p, "/sys/%s/device", b);
+    slink("../..", p);
+    snprintf(rel, sizeof rel, "../../%s", b);
+    slink(rel, "/sys/class/graphics/fb0");
+    slink(rel, "/sys/dev/char/29:0");
 }
 
 static void vts(void)
@@ -254,9 +268,9 @@ void sysfs_init(void)
     }
     input_dev(&evdev_kbd, 0, "serio0");
     input_dev(&evdev_mouse, 1, "serio1");
+    pci();
     framebuffer();
     vts();
-    pci();
     put("/sys/devices/system/cpu/online", "0\n");
     put("/sys/devices/system/cpu/possible", "0\n");
     put("/sys/devices/system/cpu/present", "0\n");

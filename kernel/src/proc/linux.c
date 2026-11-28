@@ -1278,6 +1278,15 @@ static int64_t l_renameat(int ofd, uint64_t uold, int nfd, uint64_t unew)
     return err ? err : vfs_rename(from, to);
 }
 
+static int64_t l_linkat(int ofd, uint64_t uold, int nfd, uint64_t unew, int flags)
+{
+    char from[ZK_PATH_MAX], to[ZK_PATH_MAX];
+    int err = at_path(ofd, uold, from, false);
+    if (!err)
+        err = at_path(nfd, unew, to, true);
+    return err ? err : vfs_link(from, to, flags & 0x400);    // AT_SYMLINK_FOLLOW
+}
+
 static int64_t l_symlinkat(uint64_t utarget, int dirfd, uint64_t upath)
 {
     char target[ZK_PATH_MAX], path[ZK_PATH_MAX];
@@ -1532,7 +1541,7 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 83:  return l_mkdirat(AT_FDCWD, A1, (uint32_t)A2);
     case 84:  return l_unlinkat(AT_FDCWD, A1, AT_REMOVEDIR);
     case 85:  return l_openat(AT_FDCWD, A1, O_WRONLY | O_CREAT | O_TRUNC, (uint32_t)A2);
-    case 86:  return ZK_EPERM;     // hard links
+    case 86:  return l_linkat(AT_FDCWD, A1, AT_FDCWD, A2, 0);
     case 87:  return l_unlinkat(AT_FDCWD, A1, 0);
     case 88:  return l_symlinkat(A1, AT_FDCWD, A2);
     case 89:  return l_readlinkat(AT_FDCWD, A1, A2, A3);
@@ -1656,7 +1665,7 @@ static int64_t dispatch(struct interrupt_frame *f)
     case 262: return l_stat_at((int)A1, A2, A3, (int)A4);
     case 263: return l_unlinkat((int)A1, A2, (int)A3);
     case 264: return l_renameat((int)A1, A2, (int)A3, A4);
-    case 265: return ZK_EPERM;     // linkat
+    case 265: return l_linkat((int)A1, A2, (int)A3, A4, (int)A5);
     case 266: return l_symlinkat(A1, (int)A2, A3);
     case 267: return l_readlinkat((int)A1, A2, A3, A4);
     case 268: return l_chmodat((int)A1, A2, (uint32_t)A3);

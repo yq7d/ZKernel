@@ -110,6 +110,7 @@ void fill_stat(struct vnode *v, struct zk_stat *st);
 int vfs_open(const char *path, int flags, struct file **out);
 int vfs_mkdir(const char *path);
 int vfs_unlink(const char *path);
+int vfs_link(const char *from, const char *to, bool follow);
 int vfs_stat(const char *path, struct zk_stat *st);
 // puts an existing vnode (a device) into the tree
 int vfs_mknod(const char *path, struct vnode *v);

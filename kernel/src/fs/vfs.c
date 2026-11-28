@@ -667,6 +667,42 @@ int vfs_mknod(const char *path, struct vnode *v)
     return err;
 }
 
+// a hard link, both names on the same kind of filesystem
+int vfs_link(const char *from, const char *to, bool follow)
+{
+    struct vnode *v;
+    int err = follow ? vfs_lookup(from, &v) : vfs_lookup_nofollow(from, &v);
+    if (err)
+        return err;
+    struct vnode *odir, *dir;
+    char name[ZK_NAME_MAX + 1];
+    if (v->type == VNODE_DIR) {
+        vnode_put(v);
+        return ZK_EPERM;
+    }
+    err = lookup_parent(from, &odir, name);
+    if (err) {
+        vnode_put(v);
+        return err;
+    }
+    err = lookup_parent(to, &dir, name);
+    if (!err) {
+        struct vnode *there;
+        if (dir->ops->lookup(dir, name, &there) == 0) {
+            vnode_put(there);
+            err = ZK_EEXIST;
+        } else if (dir->ops != odir->ops || !dir->ops->link) {
+            err = ZK_EXDEV;
+        } else {
+            err = dir->ops->link(dir, name, v);
+        }
+        vnode_put(dir);
+    }
+    vnode_put(odir);
+    vnode_put(v);
+    return err;
+}
+
 int vfs_unlink(const char *path)
 {
     struct vnode *dir;
