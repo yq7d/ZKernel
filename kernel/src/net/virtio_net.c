@@ -27,7 +27,7 @@
 
 #define DESC_WRITE 2
 
-#define RX_BUFS  32
+#define RX_BUFS  256
 #define TX_BUFS  16
 #define BUF_SIZE 2048
 #define HDR_LEN  10
@@ -67,7 +67,9 @@ struct vq {
 
 static int virtio_net_send(const void *frame, size_t len);
 static int virtio_net_poll(void);
-static const struct nic_ops ops = { "virtio-net", virtio_net_send, virtio_net_poll };
+static bool virtio_net_pending(void);
+static const struct nic_ops ops = { "virtio-net", virtio_net_send, virtio_net_poll,
+                                    virtio_net_pending };
 
 static uint16_t io;
 static struct vq rx, tx;
@@ -165,6 +167,11 @@ static int virtio_net_send(const void *frame, size_t len)
     tx.last_used = tx.used->idx;
     irq_restore(flags);
     return 0;
+}
+
+static bool virtio_net_pending(void)
+{
+    return present && rx.used->idx != rx.last_used;
 }
 
 static int virtio_net_poll(void)

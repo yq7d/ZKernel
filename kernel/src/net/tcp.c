@@ -1,6 +1,6 @@
 // tcp, the client side: connect, send and receive with retransmission and
-// flow control, orderly close. out of order segments are dropped and the
-// peer resends them after our duplicate acks
+// flow control, window scaling, orderly close. out of order segments are
+// kept in the receive ring until the hole before them is filled
 #include "net/tcp.h"
 #include "arch/x86_64/cpu.h"
 #include "drivers/pit.h"
@@ -18,7 +18,10 @@
 #define F_ACK 0x10
 
 #define MSS       1400
-#define BUF_SIZE  (64 * 1024)
+#define BUF_SIZE  (64 * 1024)     // send side
+#define RX_SIZE   (256 * 1024)
+#define RX_SHIFT  3               // window scale we ask for
+#define MAX_HOLES 8
 #define RTO_MIN   400
 #define RTO_MAX   8000
 #define MAX_TRIES 9
@@ -35,6 +38,10 @@ struct tcb {
     uint8_t *tx, *rx;
     size_t tx_head, tx_len;    // tx holds data from snd_una on
     size_t rx_head, rx_len;
+    uint8_t rcv_shift, snd_shift;     // 0 unless both sides agreed
+    uint32_t adv_edge;                // right edge of the window last advertised
+    struct { uint32_t start, end; } ooo[MAX_HOLES];    // out of order data past rcv_nxt
+    int nooo;
     bool closing, fin_sent, fin_acked, fin_rcvd;
     bool released;             // the socket is gone, only the protocol is left
     int err;
@@ -58,7 +65,7 @@ static bool seq_le(uint32_t a, uint32_t b) { return (int32_t)(a - b) <= 0; }
 
 static uint16_t window(struct tcb *t)
 {
-    size_t space = BUF_SIZE - t->rx_len;
+    size_t space = (RX_SIZE - t->rx_len) >> t->rcv_shift;
     return (uint16_t)(space > 65535 ? 65535 : space);
 }
 
@@ -70,16 +77,22 @@ static void wake(struct tcb *t)
 
 static int send_segment(struct tcb *t, uint32_t seq, uint8_t flags, const uint8_t *data, size_t len)
 {
-    uint8_t pkt[sizeof(struct tcp_hdr) + 4 + MSS];
+    uint8_t pkt[sizeof(struct tcp_hdr) + 8 + MSS];
     struct tcp_hdr *h = (void *)pkt;
-    size_t hl = sizeof *h + ((flags & F_SYN) ? 4 : 0);
+    size_t hl = sizeof *h + ((flags & F_SYN) ? 8 : 0);
     h->sport = htons(t->lport);
     h->dport = htons(t->rport);
     h->seq = htonl(seq);
     h->ack = (flags & F_ACK) ? htonl(t->rcv_nxt) : 0;
     h->off = (uint8_t)((hl / 4) << 4);
     h->flags = flags;
-    h->win = htons(window(t));
+    if (flags & F_SYN) {
+        size_t space = RX_SIZE - t->rx_len;
+        h->win = htons((uint16_t)(space > 65535 ? 65535 : space));
+    } else {
+        h->win = htons(window(t));
+        t->adv_edge = t->rcv_nxt + ((uint32_t)window(t) << t->rcv_shift);
+    }
     h->csum = 0;
     h->urg = 0;
     if (flags & F_SYN) {
@@ -87,6 +100,10 @@ static int send_segment(struct tcb *t, uint32_t seq, uint8_t flags, const uint8_
         pkt[21] = 4;
         pkt[22] = MSS >> 8;
         pkt[23] = MSS & 255;
+        pkt[24] = 1;    // nop, then window scale
+        pkt[25] = 3;
+        pkt[26] = 3;
+        pkt[27] = RX_SHIFT;
     }
     for (size_t i = 0; i < len; i++)
         pkt[hl + i] = data[i];
@@ -181,6 +198,83 @@ static void send_reset(uint32_t src, uint32_t dst, const struct tcp_hdr *h, size
     }
 }
 
+// window scale option of a syn, -1 if there's none
+static int syn_wscale(const struct tcp_hdr *h, size_t hl)
+{
+    const uint8_t *o = (const uint8_t *)h + sizeof *h, *end = (const uint8_t *)h + hl;
+    while (o < end) {
+        if (*o == 0)
+            break;
+        if (*o == 1) {
+            o++;
+            continue;
+        }
+        if (o + 1 >= end || o[1] < 2 || o + o[1] > end)
+            break;
+        if (o[0] == 3 && o[1] == 3)
+            return o[2];
+        o += o[1];
+    }
+    return -1;
+}
+
+// copies a segment into the ring at its place past rcv_nxt. in order data
+// moves rcv_nxt along, along with any out of order data it now touches
+static void take_data(struct tcb *t, uint32_t seq, const uint8_t *data, size_t dlen)
+{
+    // trim what we already have
+    if (seq_lt(seq, t->rcv_nxt)) {
+        uint32_t old = t->rcv_nxt - seq;
+        if (old >= dlen)
+            return;
+        data += old;
+        dlen -= old;
+        seq = t->rcv_nxt;
+    }
+    size_t off = seq - t->rcv_nxt;
+    size_t space = RX_SIZE - t->rx_len;
+    if (off >= space)
+        return;
+    if (dlen > space - off)
+        dlen = space - off;
+    size_t at = t->rx_head + t->rx_len + off;
+    for (size_t i = 0; i < dlen; i++)
+        t->rx[(at + i) % RX_SIZE] = data[i];
+    uint32_t end = seq + (uint32_t)dlen;
+
+    if (off) {
+        // remember it, merged with ranges it overlaps
+        for (int i = 0; i < t->nooo; i++) {
+            if (seq_le(t->ooo[i].start, end) && seq_le(seq, t->ooo[i].end)) {
+                if (seq_lt(t->ooo[i].start, seq))
+                    seq = t->ooo[i].start;
+                if (seq_lt(end, t->ooo[i].end))
+                    end = t->ooo[i].end;
+                t->ooo[i--] = t->ooo[--t->nooo];
+            }
+        }
+        if (t->nooo < MAX_HOLES)
+            t->ooo[t->nooo++] = (typeof(t->ooo[0])){ seq, end };
+        return;
+    }
+
+    uint32_t nxt = end;
+    for (bool more = true; more;) {
+        more = false;
+        for (int i = 0; i < t->nooo; i++) {
+            if (seq_le(t->ooo[i].start, nxt)) {
+                if (seq_lt(nxt, t->ooo[i].end))
+                    nxt = t->ooo[i].end;
+                t->ooo[i--] = t->ooo[--t->nooo];
+                more = true;
+            }
+        }
+    }
+    t->rx_len += nxt - t->rcv_nxt;
+    t->rcv_nxt = nxt;
+    wake(t);
+}
+
 void tcp_input(uint32_t src, uint32_t dst, const uint8_t *seg, size_t len)
 {
     if (len < sizeof(struct tcp_hdr))
@@ -213,7 +307,12 @@ void tcp_input(uint32_t src, uint32_t dst, const uint8_t *seg, size_t len)
             t->rcv_nxt = seq + 1;
             t->snd_una = ack;
             t->snd_nxt = ack;
-            t->snd_wnd = ntohs(h->win);
+            int ws = syn_wscale(h, hl);
+            if (ws >= 0) {
+                t->snd_shift = (uint8_t)(ws > 14 ? 14 : ws);
+                t->rcv_shift = RX_SHIFT;
+            }
+            t->snd_wnd = ntohs(h->win);    // never scaled in a syn
             t->state = ESTABLISHED;
             t->deadline = 0;
             t->tries = 0;
@@ -241,22 +340,13 @@ void tcp_input(uint32_t src, uint32_t dst, const uint8_t *seg, size_t len)
             t->deadline = t->snd_una == t->snd_nxt ? 0 : timer_uptime_ms() + t->rto;
             wake(t);
         }
-        t->snd_wnd = ntohs(h->win);
+        t->snd_wnd = (uint32_t)ntohs(h->win) << t->snd_shift;
     }
 
-    // data, only what comes in order
     bool ack_needed = false;
     if (dlen) {
-        if (seq == t->rcv_nxt && !t->fin_rcvd) {
-            size_t space = BUF_SIZE - t->rx_len;
-            size_t n = dlen < space ? dlen : space;
-            for (size_t i = 0; i < n; i++)
-                t->rx[(t->rx_head + t->rx_len + i) % BUF_SIZE] = data[i];
-            t->rx_len += n;
-            t->rcv_nxt += (uint32_t)n;
-            if (n)
-                wake(t);
-        }
+        if (!t->fin_rcvd)
+            take_data(t, seq, data, dlen);
         ack_needed = true;
     }
     if ((h->flags & F_FIN) && seq + (uint32_t)dlen == t->rcv_nxt && !t->fin_rcvd) {
@@ -321,7 +411,7 @@ void tcp_timer(void)
 struct tcb *tcp_open(uint32_t dst, uint16_t dport, uint16_t lport, int *err)
 {
     struct tcb *t = kzalloc(sizeof(*t));
-    uint8_t *tx = kmalloc(BUF_SIZE), *rx = kmalloc(BUF_SIZE);
+    uint8_t *tx = kmalloc(BUF_SIZE), *rx = kmalloc(RX_SIZE);
     if (!t || !tx || !rx) {
         kfree(t);
         kfree(tx);
@@ -441,11 +531,12 @@ int64_t tcp_recv(struct tcb *t, void *buf, size_t len, bool nonblock)
     size_t before = window(t);
     size_t n = len < t->rx_len ? len : t->rx_len;
     for (size_t i = 0; i < n; i++)
-        dst[i] = t->rx[(t->rx_head + i) % BUF_SIZE];
-    t->rx_head = (t->rx_head + n) % BUF_SIZE;
+        dst[i] = t->rx[(t->rx_head + i) % RX_SIZE];
+    t->rx_head = (t->rx_head + n) % RX_SIZE;
     t->rx_len -= n;
-    // tell the peer when a full window opens up again
-    if (before < MSS && window(t) >= MSS && t->state == ESTABLISHED)
+    // tell the peer once a good part of the buffer has opened up again
+    uint32_t edge = t->rcv_nxt + (uint32_t)(RX_SIZE - t->rx_len);
+    if (t->state == ESTABLISHED && (before < MSS || edge - t->adv_edge >= RX_SIZE / 4))
         send_ack(t);
     irq_restore(flags);
     return (int64_t)n;

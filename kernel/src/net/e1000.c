@@ -41,7 +41,7 @@
 #define TCTL_EN   (1U << 1)
 #define TCTL_PSP  (1U << 3)
 
-#define NRX 32
+#define NRX 256    // a full page of descriptors
 #define NTX 16
 #define BUF 2048
 
@@ -115,6 +115,11 @@ static int poll(void)
     return n;
 }
 
+static bool pending(void)
+{
+    return rx && (rx[rx_next].status & 1);
+}
+
 static uint16_t eeprom(uint8_t addr)
 {
     wr(EERD, 1 | (uint32_t)addr << 8);
@@ -126,7 +131,7 @@ static uint16_t eeprom(uint8_t addr)
     return 0;
 }
 
-static const struct nic_ops ops = { "e1000", send, poll };
+static const struct nic_ops ops = { "e1000", send, poll, pending };
 
 bool e1000_init(void)
 {

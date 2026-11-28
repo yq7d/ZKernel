@@ -54,7 +54,11 @@ struct nic_ops {
     const char *name;
     int (*send)(const void *frame, size_t len);
     int (*poll)(void);
+    // frames waiting, from the timer irq so it can't block
+    bool (*pending)(void);
 };
+// timer irq: wakes the net thread right away when frames came in
+void net_tick(void);
 extern const struct nic_ops *nic;
 
 // each sets nic and netif.mac when it finds its card

@@ -87,6 +87,8 @@ bool waitq_sleep_timeout(struct waitq *wq, uint64_t ms);
 
 void sched_tick(void);
 void sched_preempt(void);
+// from an irq: switch threads when it ends
+void sched_resched(void);
 
 struct thread_info {
     uint64_t id;

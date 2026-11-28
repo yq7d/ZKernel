@@ -495,13 +495,32 @@ static void configure(void *arg)
           ok ? " (dhcp)" : " (no dhcp answer, guessed)");
 }
 
+static struct waitq rx_wait = WAITQ_INIT;
+static bool net_sleeping;
+
+void net_tick(void)
+{
+    if (net_sleeping && nic && nic->pending && nic->pending()) {
+        net_sleeping = false;
+        waitq_wake_all(&rx_wait);
+        sched_resched();    // ahead of whatever is using the cpu
+    }
+}
+
 static void net_loop(void *arg)
 {
     (void)arg;
     for (;;) {
-        nic->poll();
+        while (nic->poll())
+            ;
         tcp_timer();
-        thread_sleep_ms(1);
+        uint64_t f = irq_save();
+        if (!nic->pending || !nic->pending()) {
+            net_sleeping = true;
+            waitq_sleep_timeout(&rx_wait, 1);
+            net_sleeping = false;
+        }
+        irq_restore(f);
     }
 }
 

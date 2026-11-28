@@ -433,6 +433,11 @@ void sched_tick(void)
     }
 }
 
+void sched_resched(void)
+{
+    need_resched = true;
+}
+
 // end of an irq, after the eoi
 void sched_preempt(void)
 {
