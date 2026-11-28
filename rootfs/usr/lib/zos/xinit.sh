@@ -19,7 +19,9 @@ done
 if [ -n "$ZOS_XAPP" ]; then
     # one program from xrun, the session ends with it
     twm &
-    $ZOS_XAPP
+    # kept for after: the program's output and how it ended
+    $ZOS_XAPP >/tmp/xapp.log 2>&1
+    echo "exited with status $?" >>/tmp/xapp.log
 elif [ -f "$HOME/.xinitrc" ]; then
     sh "$HOME/.xinitrc"
 else
